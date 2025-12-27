@@ -73,6 +73,23 @@ void WorkerServer::create_server(
   device.set_device();
   LOG(INFO) << "Create worker server with device: " << device.index();
 
+  // Bind worker thread to the same NUMA node as the device
+  // This prevents the thread from spanning across NUMA nodes, which would
+  // significantly degrade memory access and other performance aspects
+  int32_t numa_node = numa::get_device_numa_node(device.index());
+  if (numa_node >= 0) {
+    LOG(INFO) << "Worker thread (device " << device.index()
+              << ") binding to NUMA node " << numa_node;
+    int ret = numa::bind_thread_to_numa_node(numa_node);
+    if (ret != 0) {
+      LOG(WARNING) << "Failed to bind worker thread to NUMA node " << numa_node
+                   << ", continuing without NUMA binding";
+    }
+  } else {
+    LOG(INFO) << "NUMA node detection not available or not needed for device "
+              << device.index();
+  }
+
   auto worker_global_rank = global_rank;
   // TODO: FIXME Later
   // std::unique_ptr<WorkerImpl> worker_impl =

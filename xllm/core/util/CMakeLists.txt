@@ -18,6 +18,7 @@ cc_library(
     json_reader.h
     lightweightsemaphore.h
     net.h
+    numa_utils.h
     pretty_print.h
     scope_guard.h
     slice.h
@@ -38,6 +39,7 @@ cc_library(
     # hash_util.cpp
     json_reader.cpp
     net.cpp
+    numa_utils.cpp
     pretty_print.cpp
     threadpool.cpp
     timer.cpp

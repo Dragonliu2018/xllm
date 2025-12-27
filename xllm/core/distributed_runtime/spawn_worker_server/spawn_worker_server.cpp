@@ -27,6 +27,7 @@ limitations under the License.
 #include "core/distributed_runtime/worker_server.h"
 #include "core/platform/device.h"
 #include "core/runtime/options.h"
+#include "core/util/numa_utils.h"
 
 namespace xllm {
 
@@ -64,6 +65,23 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
   device.init_device_context();
   FLAGS_enable_atb_comm_multiprocess = true;
 #endif
+
+  // Bind worker process to the same NUMA node as the device
+  // This prevents the process from spanning across NUMA nodes, which would
+  // significantly degrade memory access and other performance aspects
+  int32_t numa_node = numa::get_device_numa_node(device_idx);
+  if (numa_node >= 0) {
+    LOG(INFO) << "Worker process (device " << device_idx
+              << ") binding to NUMA node " << numa_node;
+    int ret = numa::bind_process_to_numa_node(numa_node);
+    if (ret != 0) {
+      LOG(WARNING) << "Failed to bind worker process to NUMA node " << numa_node
+                   << ", continuing without NUMA binding";
+    }
+  } else {
+    LOG(INFO) << "NUMA node detection not available or not needed for device "
+              << device_idx;
+  }
 
   ParallelArgs parallel_args(global_rank, world_size, 1, nullptr, 1);
   WorkerServer worker_server(local_rank,
