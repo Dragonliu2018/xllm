@@ -56,6 +56,7 @@ limitations under the License.
 #include "llm/qwen2.h"               // IWYU pragma: keep
 #include "llm/qwen3.h"               // IWYU pragma: keep
 #include "llm/qwen3_moe.h"           // IWYU pragma: keep
+#include "vlm/longcat_image.h"       // IWYU pragma: keep
 #include "vlm/qwen2_5_vl.h"          // IWYU pragma: keep
 #include "vlm/qwen2_vl.h"            // IWYU pragma: keep
 #include "vlm/qwen2_vl_embedding.h"  // IWYU pragma: keep
