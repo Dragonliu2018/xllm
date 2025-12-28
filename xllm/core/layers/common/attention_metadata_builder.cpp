@@ -45,10 +45,15 @@ AttentionMetadata AttentionMetadataBuilder::build(
   attn_metadata.paged_kv_last_page_len = params.paged_kv_last_page_len;
   attn_metadata.plan_info = std::make_shared<PlanInfo>();
 
-#if defined(USE_NPU)
-  // for npu
+#if defined(USE_CUDA) || defined(USE_NPU)
+  // Pass custom attention mask (e.g. LongCat-Image text encoder padding mask)
+  // when provided. Used by CUDA FlashInfer and NPU attention.
   if (attn_mask.has_value()) {
     attn_metadata.attn_mask = attn_mask.value();
+  }
+#endif
+#if defined(USE_NPU)
+  if (attn_mask.has_value()) {
     // FIXME: The .to(kCPU) operation breaks ACL graph execution. The attention
     // operator needs to be updated to handle this.
     attn_metadata.kv_seq_lens_host = params.kv_seq_lens.to(torch::kCPU);

@@ -308,14 +308,16 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
     // Get dtype from k_cache
     const auto dtype = k_cache.scalar_type();
 
-    // Determine if causal (prefill mode)
-    // const bool causal =
-    //     attn_metadata->is_prefill || attn_metadata->is_chunked_prefill;
+    // Determine if prefill mode
+    const bool is_prefill =
+        attn_metadata->is_prefill || attn_metadata->is_chunked_prefill;
+    // Determine if causal (for CUDA graph, typically decode mode, so
+    // causal=false)
     constexpr bool causal = false;
 
     // Determine backend
     // const std::string backend =
-    //     causal ? xllm::kernel::cuda::determine_attention_backend(
+    //     is_prefill ? xllm::kernel::cuda::determine_attention_backend(
     //                  /*pos_encoding_mode=*/0,
     //                  /*use_fp16_qk_reduction=*/false,
     //                  /*use_custom_mask=*/false)
@@ -340,6 +342,7 @@ std::optional<ModelInputParams> CudaGraphPersistentParam::update(
         static_cast<int32_t>(block_size),  // block_size
         sliding_window,                    // window_size_left
         true,                              // enable_cuda_graph
+        is_prefill,                        // is_prefill
         causal,                            // causal
         attn_metadata->use_tensor_core);   // use_tensor_core
   }

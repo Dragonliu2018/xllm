@@ -32,6 +32,7 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
                       int32_t block_size,
                       int32_t window_size_left,
                       bool enable_cuda_graph,
+                      bool is_prefill,
                       bool causal,
                       bool use_tensor_core);
 

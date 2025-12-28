@@ -37,6 +37,7 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
                       int32_t block_size,
                       int32_t window_size_left,
                       bool enable_cuda_graph,
+                      bool is_prefill,
                       bool causal,
                       bool use_tensor_core) {
   CHECK(plan_info->layer_id != -1) << "Need to set layer_id to PlanInfo.";
@@ -46,7 +47,10 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
       << "update_plan_info: layer_id=" << plan_info->layer_id
       << ", enable_cuda_graph=" << enable_cuda_graph;
   // 1. prefill plan info
-  if (causal) {
+  // Note: is_prefill determines the branch (prefill vs decode)
+  // causal determines whether to use causal masking in the plan
+  // When using custom mask, causal should be false
+  if (is_prefill) {
     plan_info->uri = kernel::cuda::get_batch_prefill_uri(
         backend,
         query_dtype,

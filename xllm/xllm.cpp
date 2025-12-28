@@ -61,20 +61,36 @@ std::string get_model_type(const std::filesystem::path& model_path) {
   JsonReader reader;
   // for llm, vlm and rec models, the config.json file is in the model path
   std::filesystem::path config_json_path = model_path / "config.json";
+  std::filesystem::path model_index_path = model_path / "model_index.json";
 
   if (std::filesystem::exists(config_json_path)) {
     reader.parse(config_json_path);
-    std::string model_type = reader.value<std::string>("model_type").value();
-    if (model_type.empty()) {
-      LOG(FATAL) << "Please check config.json file in model path: "
-                 << model_path << ", it should contain model_type key.";
+    auto model_type_opt = reader.value<std::string>("model_type");
+    if (model_type_opt.has_value() && !model_type_opt->empty()) {
+      return *model_type_opt;
     }
-    return model_type;
-  } else {
-    LOG(FATAL) << "Please check config.json or model_index.json file, one of "
-                  "them should exist in the model path: "
-               << model_path;
+    // config.json exists but lacks model_type (e.g. LongCat-Image root config)
+    // Prefer model_index.json for DiT-style models
+    if (std::filesystem::exists(model_index_path)) {
+      reader.parse(model_index_path);
+      if (reader.value<std::string>("_diffusers_version").has_value()) {
+        return "dit";
+      }
+    }
+    LOG(FATAL) << "Please check config.json file in model path: " << model_path
+               << ", it should contain model_type key.";
   }
+  if (std::filesystem::exists(model_index_path)) {
+    reader.parse(model_index_path);
+    if (reader.value<std::string>("_diffusers_version").has_value()) {
+      return "dit";
+    }
+    LOG(FATAL) << "Please check model_index.json in model path: " << model_path
+               << ", it should contain _diffusers_version.";
+  }
+  LOG(FATAL) << "Please check config.json or model_index.json file, one of "
+                "them should exist in the model path: "
+             << model_path;
 }
 
 std::string get_model_backend(const std::filesystem::path& model_path) {
