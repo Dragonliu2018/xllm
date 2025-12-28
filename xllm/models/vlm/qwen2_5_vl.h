@@ -731,6 +731,16 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       multimodal_embeds = emb.value();
     }
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
+    LOG(INFO) << "[dragon-qwen2_5_vl]";
+    LOG(INFO) << "[qwen2_5_vl] inputs_embeds shape: "
+              << inputs_embeds.sizes();  // [qwen2_5_vl] inputs_embeds shape:
+                                         // [1, 512, 3584]
+    LOG(INFO)
+        << "[qwen2_5_vl] inputs_embeds min: "
+        << inputs_embeds.min().item<float>()
+        << ", max: " << inputs_embeds.max().item<float>() << ", mean: "
+        << inputs_embeds.mean().item<float>();  // [qwen2_5_vl] inputs_embeds
+                                                // min: 0, max: 0, mean: 0
     if (!multimodal_embeds.defined()) {
       return inputs_embeds;
     }
@@ -740,12 +750,163 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return inputs_embeds;
   }
 
+  // Standard forward pass
   torch::Tensor forward(const torch::Tensor& tokens,
                         const torch::Tensor& positions,
                         std::vector<KVCache>& kv_caches,
                         const ModelInputParams& input_params) {
-    auto emb = language_model_(tokens, positions, kv_caches, input_params);
-    return emb;
+    return language_model_(tokens, positions, kv_caches, input_params);
+  }
+
+  // Special forward pass for LongCat-Image with attention_mask support
+  // This matches the diffusers implementation for proper text encoder output
+  // The attention_mask is [batch_size, seq_len] where 1 = real tokens, 0 =
+  // padding
+  torch::Tensor forward_longcat(const torch::Tensor& tokens,
+                                const torch::Tensor& positions,
+                                std::vector<KVCache>& kv_caches,
+                                const ModelInputParams& input_params,
+                                const torch::Tensor& attention_mask) {
+    // In diffusers, attention_mask is passed to the text encoder and used
+    // INSIDE the attention mechanism (as an additive mask for softmax).
+    // This prevents padding tokens from being attended to, but does NOT
+    // zero out their embeddings or outputs.
+    //
+    // IMPORTANT: We do NOT multiply hidden_states by the mask before or after
+    // the transformer. This would cause:
+    // - Different LayerNorm behavior (zeros change the distribution)
+    // - Different residual connection behavior
+    // - Lower output variance (~2x difference) compared to diffusers
+    //
+    // Instead, we pass the attention_mask to graph_buffer.attn_mask for the
+    // attention layers to use internally during softmax computation.
+
+    // Ensure kv_caches has enough space for all layers (for prefill, we don't
+    // use KV cache) The language_model expects kv_caches to have one element
+    // per layer Even though we set empty_kv_cache=true, the vector must be
+    // properly sized
+    if (kv_caches.size() == 0) {
+      // Get the number of layers from model_args
+      int num_layers = model_args_.n_layers();
+      kv_caches.resize(num_layers);  // Initialize with empty KVCache objects
+      LOG(WARNING) << "[forward_longcat] Initialized kv_caches with "
+                   << num_layers << " empty caches";
+    }
+
+    // Get embeddings for all tokens
+    // tokens shape: [batch_size * seq_len]
+    // returned shape: [batch_size * seq_len, hidden_size]
+    auto hidden_states = language_model_->get_input_embeddings(tokens);
+
+    // Debug: Log input embeddings to compare with diffusers
+    // diffusers: shape [1, 553, 3584], min: -0.371, max: 1.156, mean: 0.000035,
+    // std: 0.018
+    LOG(INFO) << "[forward_longcat] Input embeddings (before transformer) - "
+              << "shape: " << hidden_states.sizes()
+              << ", min: " << hidden_states.min().item<float>()
+              << ", max: " << hidden_states.max().item<float>()
+              << ", mean: " << hidden_states.mean().item<float>()
+              << ", std: " << hidden_states.std().item<float>();
+
+    // NOTE: Do NOT multiply hidden_states by attention mask here!
+    // In diffusers, the attention_mask is used INSIDE the attention mechanism
+    // (as an additive mask for softmax), not as a multiplicative mask on hidden
+    // states. Multiplying hidden_states by the mask would:
+    // 1. Zero out padding token embeddings before the transformer
+    // 2. Change the behavior of LayerNorm and residual connections
+    // 3. Result in different output statistics (lower std) than diffusers
+    // The attention mask should only be used in the attention computation.
+
+    // Now process through transformer layers with pre-masked embeddings
+    // Create a modified input_params with the pre-masked embeddings and
+    // attention mask
+    auto modified_input_params = input_params;
+
+    // CRITICAL FIX: Set proper sequence length and prefill flags for attention
+    // to work The input_params passed in may have seq_len = 0, which causes
+    // attention to skip processing We need to set it based on the actual token
+    // sequence length
+
+    // MROPE Support: HuggingFace Qwen2_5_VL uses MROPE even for text-only
+    // Position format: [3, seq_len] where 3 = (T, H, W) MROPE dimensions
+    // For text-only, all 3 dimensions use the same positions
+    // Keep positions as-is to trigger apply_mrope() in llm_model_base.h
+    int64_t actual_seq_len;
+    if (positions.dim() == 2) {
+      // MROPE format: [3, seq_len] - keep as-is for MROPE processing
+      actual_seq_len = positions.size(1);  // seq_len is the second dimension
+      LOG(INFO) << "[forward_longcat] Using MROPE positions: shape="
+                << positions.sizes() << ", seq_len=" << actual_seq_len;
+    } else if (positions.dim() == 1) {
+      // Legacy 1D format: [seq_len]
+      actual_seq_len = positions.size(0);
+      LOG(WARNING) << "[forward_longcat] Using 1D positions (no MROPE): "
+                   << positions.sizes();
+    } else {
+      LOG(WARNING)
+          << "[forward_longcat] WARNING: Unexpected positions dimensions: "
+          << positions.dim();
+      actual_seq_len = positions.numel();  // fallback
+    }
+    LOG(INFO) << "[forward_longcat] Setting seq_len: actual_seq_len="
+              << actual_seq_len;
+
+    // Update input_params with correct sequence lengths for the transformer
+    // layers
+    if (actual_seq_len > 0) {
+      modified_input_params.q_max_seq_len = actual_seq_len;
+      modified_input_params.kv_max_seq_len = actual_seq_len;
+
+      // Also set q_seq_lens and kv_seq_lens as cumulative sequence lengths
+      // For prefill (all tokens at once), we have one sequence of length
+      // actual_seq_len
+      std::vector<int> cu_seqlens_vec = {0, static_cast<int>(actual_seq_len)};
+      torch::Tensor cu_seqlens =
+          torch::tensor(cu_seqlens_vec, torch::kInt).to(tokens.device());
+      modified_input_params.q_seq_lens = cu_seqlens;
+      modified_input_params.kv_seq_lens = cu_seqlens;
+
+      // Set batch_forward_type to PREFILL so that attention uses prefill path
+      // (not decode path which requires paged_kv_indptr)
+      // MROPE will be triggered in llm_model_base.h when positions.dim() == 2
+      modified_input_params.batch_forward_type = BatchForwardType::PREFILL;
+      // Note: empty_kv_cache and global_empty_kv_cache are no longer members of
+      // ModelInputParams
+    }
+
+    modified_input_params.input_embedding = hidden_states;
+
+    // Set attention mask in graph_buffer for transformer layers to use
+    // Flatten the mask from [batch, seq_len] to [batch * seq_len] to match the
+    // flattened token sequence
+    if (attention_mask.defined() && attention_mask.size(0) > 0) {
+      // Flatten attention_mask: [batch_size, seq_len] -> [batch_size * seq_len]
+      auto attn_mask_flat = attention_mask.view({-1});
+
+      // Ensure mask is float type for FlashInfer
+      // attention_mask format: 1.0 = attend, 0.0 = mask out (padding)
+      auto attn_mask_float = attn_mask_flat.to(torch::kFloat32);
+      modified_input_params.graph_buffer.attn_mask = attn_mask_float;
+
+      // Debug: Log mask information
+      VLOG(0) << "[forward_longcat] Set attention_mask in graph_buffer, "
+                 "flattened shape: ["
+              << attn_mask_float.size(0) << "]";
+    }
+
+    // Call language model which will use the pre-masked embeddings and
+    // attention mask. When positions is 2D [3, seq_len], MROPE will be applied
+    // in llm_model_base.h, matching HuggingFace's Qwen2_5_VL behavior
+    hidden_states =
+        language_model_(tokens, positions, kv_caches, modified_input_params);
+
+    // NOTE: Do NOT multiply hidden_states by attention mask here either!
+    // The output from the transformer should preserve the full hidden states.
+    // In diffusers, padding tokens still have valid outputs (they just don't
+    // attend to other tokens). Zeroing them out would change the output
+    // statistics and produce different results than diffusers.
+
+    return hidden_states;
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
@@ -763,6 +924,19 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     }
   }
 
+  // Load state dict for both visual and language_model components
+  void load_state_dict(const StateDict& state_dict) {
+    // Load visual component weights
+    visual_->load_state_dict(state_dict.get_dict_with_prefix("visual."));
+
+    // Load language model component weights
+    auto language_model = language_model_;
+    if (language_model) {
+      language_model->load_state_dict(
+          state_dict.get_dict_with_prefix("language_model."));  // bug?
+    }
+  }
+
   layer::LmHead get_lm_head() { return language_model_->get_lm_head(); }
   void set_lm_head(layer::LmHead& head) { language_model_->set_lm_head(head); }
 
@@ -773,6 +947,11 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
   void set_word_embedding(layer::WordEmbedding& word_embedding) {
     language_model_->set_word_embedding(word_embedding);
   }
+
+  // Getters for accessing internal components (for model loading)
+  Qwen2_5_VisionTransformer get_visual() { return visual_; }
+
+  QWen2ForCausalLM get_language_model() { return language_model_; }
 
  private:
   ModelArgs model_args_;
@@ -788,6 +967,66 @@ REGISTER_CAUSAL_VLM_MODEL(qwen2_5_vl, Qwen2_5_VLForConditionalGeneration);
 REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
 
 REGISTER_MODEL_ARGS(qwen2_5_vl, [&] {
+  // text config
+  // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
+  LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);
+  LOAD_ARG_OR(eos_token_id, "eos_token_id", 151645);
+  LOAD_ARG_OR(vision_start_token_id, "vision_start_token_id", 151652);
+  LOAD_ARG_OR(vision_end_token_id, "vision_end_token_id", 151653);
+  LOAD_ARG_OR(vision_token_id, "vision_token_id", 151654);
+  LOAD_ARG_OR(image_token_id, "image_token_id", 151655);
+  LOAD_ARG_OR(video_token_id, "video_token_id", 151656);
+  LOAD_ARG_OR(hidden_act, "hidden_act", "silu");
+  LOAD_ARG_OR(hidden_size, "hidden_size", 3584);
+  // LOAD_ARG_OR(initializer_range, "initializer_range", 0.02);
+  LOAD_ARG_OR(intermediate_size, "intermediate_size", 18944);
+  LOAD_ARG_OR(max_position_embeddings, "max_position_embeddings", 128000);
+  LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
+  LOAD_ARG_OR(model_type, "model_type", "qwen2_5_vl");
+  LOAD_ARG_OR(n_heads, "num_attention_heads", 28);
+  LOAD_ARG_OR(n_layers, "num_hidden_layers", 28);
+  LOAD_ARG_OR(n_kv_heads, "num_key_value_heads", 4);
+  LOAD_ARG_OR(rms_norm_eps, "rms_norm_eps", 1e-06);
+  LOAD_ARG_OR(rope_theta, "rope_theta", 1000000.0f);
+  LOAD_ARG_OR(sliding_window, "sliding_window", 32768);
+  LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
+  LOAD_ARG_OR(dtype, "torch_dtype", "");
+  // LOAD_ARG_OR(transformers_version, "transformers_version", "4.41.2");
+  // LOAD_ARG_OR(use_cache, "use_cache", true);
+  LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
+  LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
+    return args->hidden_size() / args->n_heads();
+  });
+
+  // vision_config
+  LOAD_ARG_OR(mm_num_hidden_layers, "vision_config.depth", 32);
+  LOAD_ARG_OR(mm_hidden_act, "vision_config.hidden_act", "silu");
+  LOAD_ARG_OR(mm_hidden_size, "vision_config.hidden_size", 1280);
+  LOAD_ARG_OR(mm_intermediate_size, "vision_config.intermediate_size", 3420);
+  LOAD_ARG_OR(mm_num_attention_heads, "vision_config.num_heads", 16);
+  LOAD_ARG_OR(mm_num_channels, "vision_config.in_chans", 3);
+  LOAD_ARG_OR(mm_projection_dim, "vision_config.out_hidden_size", 3584);
+  LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 14);
+  LOAD_ARG_OR(mm_spatial_merge_size, "vision_config.spatial_merge_size", 2);
+  LOAD_ARG_OR(mm_spatial_patch_size, "vision_config.spatial_patch_size", 14);
+  LOAD_ARG_OR(mm_window_size, "vision_config.window_size", 112);
+  LOAD_ARG_OR(mm_fullatt_block_indexes,
+              "vision_config.fullatt_block_indexes",
+              std::vector<int64_t>({7, 15, 23, 31}));
+  LOAD_ARG_OR(mm_tokens_per_second, "vision_config.tokens_per_second", 2);
+  LOAD_ARG_OR(mm_temporal_patch_size, "vision_config.temporal_patch_size", 2);
+  LOAD_ARG_OR_FUNC(mm_head_dim, "head_dim", [&] {
+    return args->mm_hidden_size() / args->mm_num_attention_heads();
+  });
+
+  LOAD_ARG_OR(
+      rope_scaling_rope_type, "vision_config.rope_scaling.type", "mrope");
+  LOAD_ARG(rope_scaling_mrope_section, "rope_scaling.mrope_section");
+  LOAD_ARG_OR(vocab_size, "vocab_size", 152064);
+});
+
+// Register additional args loader for the full class name used by LongCat-Image
+REGISTER_MODEL_ARGS(Qwen2_5_VLForConditionalGeneration, [&] {
   // text config
   // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);

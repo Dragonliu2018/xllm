@@ -69,6 +69,22 @@ const DiTRequestOutput DiTRequest::generate_output() {
   for (size_t idx = 0; idx < count; ++idx) {
     torch::Tensor image =
         output_.tensors[idx].squeeze(0).cpu().to(torch::kFloat32).contiguous();
+
+    LOG(INFO) << "[DiTRequest] Before encoding, image shape: " << image.sizes()
+              << ", dtype: " << image.dtype() << ", device: " << image.device()
+              << ", min: " << image.min().item<float>()
+              << ", max: " << image.max().item<float>()
+              << ", mean: " << image.mean().item<float>();
+
+    // Sample a few pixels to verify values
+    if (image.size(1) > 0 && image.size(2) > 0) {
+      auto pixel_0_0 = image.index({torch::indexing::Slice(0, 3), 0, 0});
+      LOG(INFO) << "[DiTRequest] Pixel (0,0) RGB values: R="
+                << pixel_0_0[0].item<float>()
+                << ", G=" << pixel_0_0[1].item<float>()
+                << ", B=" << pixel_0_0[2].item<float>();
+    }
+
     encoder.encode(image, result.image);
     output.outputs.push_back(result);
   }

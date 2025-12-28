@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,16 @@ class LlmModelImplBase : public torch::nn::Module {
     if (positions.dim() == 2) {
       std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
           apply_mrope(positions);
+    } else if (positions.dim() == 2 && mrope_section_.empty()) {
+      LOG(WARNING)
+          << "[llm_model_base] positions is 2D but mrope_section_ is empty! "
+          << "Falling back to regular RoPE. This may cause incorrect results. "
+          << "Check if rope_scaling.mrope_section is set in model config.";
+      // Convert 2D positions to 1D by taking the first row (all rows should be
+      // same for text)
+      positions = positions[0].contiguous();
+      LOG(INFO) << "[llm_model_base] Converted positions to 1D: "
+                << positions.sizes();
     }
 
     std::optional<torch::Tensor> residual;

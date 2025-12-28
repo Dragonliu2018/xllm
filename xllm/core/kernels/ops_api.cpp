@@ -50,7 +50,44 @@ void apply_rotary(RotaryParams& params) {
 #elif defined(USE_CUDA)
   bool is_neox = !params.interleaved;
 
-  auto pos_ids = params.position_ids.value().to(torch::kInt64);
+  // NOTE:
+  // For standard RoPE, CUDA path expects explicit position_ids.
+  // For MRoPE (multimodal RoPE), we may not have position_ids and instead rely
+  // on cu_query_lens and precomputed cos/sin. However, the current CUDA
+  // implementation only supports the standard RoPE kernel.
+  //
+  // To avoid crashes (std::bad_optional_access) while preserving behavior as
+  // much as possible, we:
+  // - Use provided position_ids when available (standard RoPE).
+  // - If position_ids is absent but cu_query_lens is provided (prefill path),
+  //   synthesize a simple sequential position_ids [0, 1, ..., T-1].
+  //   This effectively falls back to standard RoPE semantics, which matches
+  //   the previous xllm behavior for text-only use cases.
+  torch::Tensor pos_ids;
+  if (params.position_ids.has_value()) {
+    pos_ids = params.position_ids.value().to(torch::kInt64);
+  } else if (params.cu_query_lens.has_value()) {
+    auto cu = params.cu_query_lens.value().to(torch::kInt64);
+    TORCH_CHECK(
+        cu.numel() >= 2,
+        "apply_rotary (CUDA): cu_query_lens must have at least 2 elements when "
+        "position_ids is not provided.");
+    int64_t T = cu[1].item<int64_t>() - cu[0].item<int64_t>();
+    TORCH_CHECK(T > 0,
+                "apply_rotary (CUDA): invalid sequence length inferred from "
+                "cu_query_lens when position_ids is not provided.");
+    pos_ids = torch::arange(T,
+                            torch::TensorOptions()
+                                .dtype(torch::kInt64)
+                                .device(params.q.device()))
+                  .contiguous();
+  } else {
+    TORCH_CHECK(
+        false,
+        "apply_rotary (CUDA): neither position_ids nor cu_query_lens provided; "
+        "cannot infer positions.");
+  }
+
   auto cos_sin_vec = params.cos_sin.chunk(4, -1);
   auto cos = cos_sin_vec[0];
   auto sin = cos_sin_vec[2];
@@ -196,7 +233,8 @@ void batch_prefill(AttentionParams& params) {
                       params.scale,
                       params.output,
                       params.output_lse,
-                      params.attn_metadata.enable_cuda_graph);
+                      params.attn_metadata.enable_cuda_graph,
+                      params.mask);
 #elif defined(USE_ILU)
   std::optional<torch::Tensor> block_tables;
   if (params.attn_metadata.is_chunked_prefill) {
