@@ -774,6 +774,16 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       multimodal_embeds = emb.value();
     }
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
+    LOG(INFO) << "[dragon-qwen2_5_vl]";
+    LOG(INFO) << "[qwen2_5_vl] inputs_embeds shape: "
+              << inputs_embeds.sizes();  // [qwen2_5_vl] inputs_embeds shape:
+                                         // [1, 512, 3584]
+    LOG(INFO)
+        << "[qwen2_5_vl] inputs_embeds min: "
+        << inputs_embeds.min().item<float>()
+        << ", max: " << inputs_embeds.max().item<float>() << ", mean: "
+        << inputs_embeds.mean().item<float>();  // [qwen2_5_vl] inputs_embeds
+                                                // min: 0, max: 0, mean: 0
     if (!multimodal_embeds.defined()) {
       return inputs_embeds;
     }
@@ -806,6 +816,19 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     }
   }
 
+  // Load state dict for both visual and language_model components
+  void load_state_dict(const StateDict& state_dict) {
+    // Load visual component weights
+    visual_->load_state_dict(state_dict.get_dict_with_prefix("visual."));
+
+    // Load language model component weights
+    auto language_model = language_model_;
+    if (language_model) {
+      language_model->load_state_dict(
+          state_dict.get_dict_with_prefix("language_model."));  // bug?
+    }
+  }
+
   layer::LmHead get_lm_head() { return language_model_->get_lm_head(); }
   void set_lm_head(layer::LmHead& head) { language_model_->set_lm_head(head); }
 
@@ -816,6 +839,11 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
   void set_word_embedding(layer::WordEmbedding& word_embedding) {
     language_model_->set_word_embedding(word_embedding);
   }
+
+  // Getters for accessing internal components (for model loading)
+  Qwen2_5_VisionTransformer get_visual() { return visual_; }
+
+  QWen2ForCausalLM get_language_model() { return language_model_; }
 
  private:
   ModelArgs model_args_;
@@ -831,6 +859,66 @@ REGISTER_CAUSAL_VLM_MODEL(qwen2_5_vl, Qwen2_5_VLForConditionalGeneration);
 REGISTER_IMAGE_PROCESSOR(qwen2_5_vl, Qwen2VLImageProcessor);
 
 REGISTER_MODEL_ARGS(qwen2_5_vl, [&] {
+  // text config
+  // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
+  LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);
+  LOAD_ARG_OR(eos_token_id, "eos_token_id", 151645);
+  LOAD_ARG_OR(vision_start_token_id, "vision_start_token_id", 151652);
+  LOAD_ARG_OR(vision_end_token_id, "vision_end_token_id", 151653);
+  LOAD_ARG_OR(vision_token_id, "vision_token_id", 151654);
+  LOAD_ARG_OR(image_token_id, "image_token_id", 151655);
+  LOAD_ARG_OR(video_token_id, "video_token_id", 151656);
+  LOAD_ARG_OR(hidden_act, "hidden_act", "silu");
+  LOAD_ARG_OR(hidden_size, "hidden_size", 3584);
+  // LOAD_ARG_OR(initializer_range, "initializer_range", 0.02);
+  LOAD_ARG_OR(intermediate_size, "intermediate_size", 18944);
+  LOAD_ARG_OR(max_position_embeddings, "max_position_embeddings", 128000);
+  LOAD_ARG_OR(max_window_layers, "max_window_layers", 28);
+  LOAD_ARG_OR(model_type, "model_type", "qwen2_5_vl");
+  LOAD_ARG_OR(n_heads, "num_attention_heads", 28);
+  LOAD_ARG_OR(n_layers, "num_hidden_layers", 28);
+  LOAD_ARG_OR(n_kv_heads, "num_key_value_heads", 4);
+  LOAD_ARG_OR(rms_norm_eps, "rms_norm_eps", 1e-06);
+  LOAD_ARG_OR(rope_theta, "rope_theta", 1000000.0f);
+  LOAD_ARG_OR(sliding_window, "sliding_window", 32768);
+  LOAD_ARG_OR(tie_word_embeddings, "tie_word_embeddings", false);
+  LOAD_ARG_OR(dtype, "torch_dtype", "");
+  // LOAD_ARG_OR(transformers_version, "transformers_version", "4.41.2");
+  // LOAD_ARG_OR(use_cache, "use_cache", true);
+  LOAD_ARG_OR(use_sliding_window, "use_sliding_window", false);
+  LOAD_ARG_OR_FUNC(head_dim, "head_dim", [&] {
+    return args->hidden_size() / args->n_heads();
+  });
+
+  // vision_config
+  LOAD_ARG_OR(mm_num_hidden_layers, "vision_config.depth", 32);
+  LOAD_ARG_OR(mm_hidden_act, "vision_config.hidden_act", "silu");
+  LOAD_ARG_OR(mm_hidden_size, "vision_config.hidden_size", 1280);
+  LOAD_ARG_OR(mm_intermediate_size, "vision_config.intermediate_size", 3420);
+  LOAD_ARG_OR(mm_num_attention_heads, "vision_config.num_heads", 16);
+  LOAD_ARG_OR(mm_num_channels, "vision_config.in_chans", 3);
+  LOAD_ARG_OR(mm_projection_dim, "vision_config.out_hidden_size", 3584);
+  LOAD_ARG_OR(mm_patch_size, "vision_config.patch_size", 14);
+  LOAD_ARG_OR(mm_spatial_merge_size, "vision_config.spatial_merge_size", 2);
+  LOAD_ARG_OR(mm_spatial_patch_size, "vision_config.spatial_patch_size", 14);
+  LOAD_ARG_OR(mm_window_size, "vision_config.window_size", 112);
+  LOAD_ARG_OR(mm_fullatt_block_indexes,
+              "vision_config.fullatt_block_indexes",
+              std::vector<int64_t>({7, 15, 23, 31}));
+  LOAD_ARG_OR(mm_tokens_per_second, "vision_config.tokens_per_second", 2);
+  LOAD_ARG_OR(mm_temporal_patch_size, "vision_config.temporal_patch_size", 2);
+  LOAD_ARG_OR_FUNC(mm_head_dim, "head_dim", [&] {
+    return args->mm_hidden_size() / args->mm_num_attention_heads();
+  });
+
+  LOAD_ARG_OR(
+      rope_scaling_rope_type, "vision_config.rope_scaling.type", "mrope");
+  LOAD_ARG(rope_scaling_mrope_section, "rope_scaling.mrope_section");
+  LOAD_ARG_OR(vocab_size, "vocab_size", 152064);
+});
+
+// Register additional args loader for the full class name used by LongCat-Image
+REGISTER_MODEL_ARGS(Qwen2_5_VLForConditionalGeneration, [&] {
   // text config
   // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);

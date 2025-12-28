@@ -636,11 +636,13 @@ class TimestepsImpl : public torch::nn::Module {
   explicit TimestepsImpl(ModelContext context) {}
 
   torch::Tensor forward(const torch::Tensor& timesteps) {
+    // Match Python: Timesteps(num_channels=256, flip_sin_to_cos=True,
+    // downscale_freq_shift=0)
     return get_timestep_embedding(timesteps,
-                                  256,  // embedding_dim
-                                  true,
-                                  0.0f,  // flip_sin_to_cos
-                                  1,
+                                  256,   // embedding_dim
+                                  true,  // flip_sin_to_cos
+                                  0.0f,  // downscale_freq_shift
+                                  1.0f,  // scale
                                   10000  // max_period
     );
   }
@@ -667,7 +669,9 @@ class TimestepEmbeddingImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& sample,
                         const torch::Tensor& condition = torch::Tensor()) {
-    torch::Tensor x1 = linear_1_->forward(sample);
+    // Ensure sample is in the correct dtype for the linear layer
+    torch::Tensor sample_converted = sample.to(options_.dtype());
+    torch::Tensor x1 = linear_1_->forward(sample_converted);
     x1 = act_fn_->forward(x1);
     x1 = linear_2_->forward(x1);
     return x1;
@@ -695,6 +699,45 @@ class TimestepEmbeddingImpl : public torch::nn::Module {
   torch::TensorOptions options_;
 };
 TORCH_MODULE(TimestepEmbedding);
+
+// LongCat-Image specific timestep embeddings (only timestep, no text)
+// Matches Python: LongCatImageTimestepEmbeddings
+class LongCatImageTimestepEmbeddingsImpl : public torch::nn::Module {
+ public:
+  explicit LongCatImageTimestepEmbeddingsImpl(const ModelContext& context)
+      : options_(context.get_tensor_options()) {
+    time_proj_ = Timesteps(context);
+    timestep_embedder_ = TimestepEmbedding(context);
+  }
+
+  torch::Tensor forward(const torch::Tensor& timestep,
+                        torch::Dtype hidden_dtype = torch::kBFloat16) {
+    auto timesteps_proj = time_proj_(timestep);
+    // Match Python: timesteps_emb =
+    // self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype)) Compute in
+    // Float32 for numerical stability, then convert to target dtype
+    auto timesteps_proj_f32 = timesteps_proj.to(torch::kFloat32);
+    auto timesteps_emb_f32 = timestep_embedder_(timesteps_proj_f32);
+    auto timesteps_emb = timesteps_emb_f32.to(hidden_dtype);
+    return timesteps_emb;
+  }
+
+  void load_state_dict(const StateDict& state_dict) {
+    // timestep_embedder only (no text_embedder)
+    timestep_embedder_->load_state_dict(
+        state_dict.get_dict_with_prefix("timestep_embedder."));
+  }
+
+  void verify_loaded_weights(const std::string& prefix) const {
+    timestep_embedder_->verify_loaded_weights(prefix + "timestep_embedder.");
+  }
+
+ private:
+  Timesteps time_proj_{nullptr};
+  TimestepEmbedding timestep_embedder_{nullptr};
+  torch::TensorOptions options_;
+};
+TORCH_MODULE(LongCatImageTimestepEmbeddings);
 
 class CombinedTimestepTextProjEmbeddingsImpl : public torch::nn::Module {
  public:
@@ -1050,19 +1093,55 @@ class FluxSingleTransformerBlockImpl : public torch::nn::Module {
     attn_ = register_module("attn", FluxSingleAttention(context));
   }
 
-  torch::Tensor forward(
+  std::tuple<torch::Tensor, torch::Tensor> forward(
       const torch::Tensor& hidden_states,
+      const torch::Tensor& encoder_hidden_states,
       const torch::Tensor& temb,
       const torch::Tensor& image_rotary_emb = torch::Tensor()) {
-    auto residual = hidden_states;
-    auto [norm_hidden_states, gate] = norm_(hidden_states, temb);
+    // Match Python: LongCatImageSingleTransformerBlock.forward
+    // text_seq_len = encoder_hidden_states.shape[1]
+    // hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+    int64_t text_seq_len = encoder_hidden_states.size(1);
+    auto hidden_states_cat =
+        torch::cat({encoder_hidden_states, hidden_states}, 1);
+
+    // residual = hidden_states
+    auto residual = hidden_states_cat;
+
+    // norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
+    auto [norm_hidden_states, gate] = norm_(hidden_states_cat, temb);
+
+    // mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
     auto mlp_hidden_states = act_mlp_(proj_mlp_(norm_hidden_states));
+
+    // attn_output = self.attn(hidden_states=norm_hidden_states,
+    // image_rotary_emb=image_rotary_emb)
     auto attn_output = attn_->forward(norm_hidden_states, image_rotary_emb);
-    auto hidden_states_cat = torch::cat({attn_output, mlp_hidden_states}, 2);
-    auto out = proj_out_(hidden_states_cat);
+
+    // hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
+    auto hidden_states_cat_processed =
+        torch::cat({attn_output, mlp_hidden_states}, 2);
+
+    // gate = gate.unsqueeze(1)
+    // hidden_states = gate * self.proj_out(hidden_states)
+    auto out = proj_out_(hidden_states_cat_processed);
     out = gate.unsqueeze(1) * out;
+
+    // hidden_states = residual + hidden_states
     out = residual + out;
-    return out;
+
+    // if hidden_states.dtype == torch.float16:
+    //     hidden_states = hidden_states.clip(-65504, 65504)
+    if (out.scalar_type() == torch::kFloat16) {
+      out = torch::clamp(out, -65504.0f, 65504.0f);
+    }
+
+    // encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len],
+    // hidden_states[:, text_seq_len:]
+    auto new_encoder_hidden = out.narrow(1, 0, text_seq_len);
+    auto new_hidden = out.narrow(1, text_seq_len, out.size(1) - text_seq_len);
+
+    return std::make_tuple(new_encoder_hidden, new_hidden);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -1225,14 +1304,11 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
         register_module("transformer_blocks", torch::nn::ModuleList());
     single_transformer_blocks_ =
         register_module("single_transformer_blocks", torch::nn::ModuleList());
-    if (guidance_embeds_) {
-      time_text_guidance_embed_ =
-          register_module("time_text_guidance_embed",
-                          CombinedTimestepGuidanceTextProjEmbeddings(context));
-    } else {
-      time_text_embed_ = register_module(
-          "time_text_embed", CombinedTimestepTextProjEmbeddings(context));
-    }
+
+    // LongCat-Image uses LongCatImageTimestepEmbeddings (only timestep, no
+    // text) Text embeddings are handled separately via pooled_projections
+    time_embed_ =
+        register_module("time_embed", LongCatImageTimestepEmbeddings(context));
     context_embedder_ = register_module(
         "context_embedder", DiTLinear(joint_attention_dim, inner_dim));
     x_embedder_ =
@@ -1268,15 +1344,16 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
                         const torch::Tensor& guidance,
                         int64_t step_idx = 0) {
     torch::Tensor hidden_states = x_embedder_->forward(hidden_states_input);
+
+    // Match Python: timestep = timestep.to(hidden_states.dtype) * 1000
+    // This is the timestep scaling used in the pipeline
     auto timestep_scaled = timestep.to(hidden_states.dtype()) * 1000.0f;
-    torch::Tensor temb;
-    if (guidance.defined()) {
-      auto guidance_scaled = guidance.to(hidden_states.dtype()) * 1000.0f;
-      temb = time_text_guidance_embed_->forward(
-          timestep_scaled, guidance_scaled, pooled_projections);
-    } else {
-      temb = time_text_embed_->forward(timestep_scaled, pooled_projections);
-    }
+
+    // Get timestep embedding (LongCat-Image only has timestep, not text)
+    // Pass hidden_states.scalar_type() to ensure timestep embedding is in
+    // correct dtype
+    auto temb =
+        time_embed_->forward(timestep_scaled, hidden_states.scalar_type());
     torch::Tensor encoder_hidden_states =
         context_embedder_->forward(encoder_hidden_states_input);
 
@@ -1325,8 +1402,8 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
             blockout_after.tensors.at("encoder_hidden_states");
       }
 
-      hidden_states = torch::cat({encoder_hidden_states, hidden_states}, 1);
-
+      // For single transformer blocks, concat and split happens inside each
+      // block (to match Python LongCatImageSingleTransformerBlock behavior)
       for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
         // Block start: prepare input (block_id)
         CacheBlockIn blockin_before(i);
@@ -1335,26 +1412,30 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
 
         if (!use_block_cache) {
           auto block = single_transformer_block_layers_[i];
-          hidden_states = block->forward(hidden_states, temb, image_rotary_emb);
+          // Single block internally concatenates and splits
+          auto [new_encoder_hidden, new_hidden] = block->forward(
+              hidden_states, encoder_hidden_states, temb, image_rotary_emb);
+          // Update both for next iteration
+          encoder_hidden_states = new_encoder_hidden;
+          hidden_states = new_hidden;
         }
 
         // Block end: update outputs (block_id, hidden_states,
-        // original_hidden_states)
+        // encoder_hidden_states, original_hidden_states,
+        // original_encoder_hidden_states)
         TensorMap single_block_map = {
             {"hidden_states", hidden_states},
-            {"original_hidden_states", original_hidden_states}};
+            {"encoder_hidden_states", encoder_hidden_states},
+            {"original_hidden_states", original_hidden_states},
+            {"original_encoder_hidden_states", original_encoder_hidden_states}};
         CacheBlockIn blockin_after(i, single_block_map);
         CacheBlockOut blockout_after =
             DiTCache::get_instance().on_after_block(blockin_after);
 
         hidden_states = blockout_after.tensors.at("hidden_states");
+        encoder_hidden_states =
+            blockout_after.tensors.at("encoder_hidden_states");
       }
-
-      int64_t start = encoder_hidden_states.size(1);
-      int64_t length = hidden_states.size(1) - start;
-      auto output_hidden =
-          hidden_states.narrow(1, start, std::max(length, int64_t(0)));
-      hidden_states = output_hidden;
     }
 
     // Step end: update outputs (hidden_states, original_hidden_states)
@@ -1379,14 +1460,9 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
       // x_embedder
       x_embedder_->load_state_dict(
           state_dict->get_dict_with_prefix("x_embedder."));
-      // time_text_embed
-      if (time_text_embed_) {
-        time_text_embed_->load_state_dict(
-            state_dict->get_dict_with_prefix("time_text_embed."));
-      } else {
-        time_text_guidance_embed_->load_state_dict(
-            state_dict->get_dict_with_prefix("time_text_embed."));
-      }
+      // time_embed (LongCat-Image specific - only timestep embedding)
+      time_embed_->load_state_dict(
+          state_dict->get_dict_with_prefix("time_embed."));
       // transformer_blocks
       for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
         auto block = transformer_block_layers_[i];
@@ -1411,13 +1487,8 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
     context_embedder_->verify_loaded_weights(prefix + "context_embedder.");
     // x_embedder
     x_embedder_->verify_loaded_weights(prefix + "x_embedder.");
-    // time_text_embed
-    if (time_text_embed_) {
-      time_text_embed_->verify_loaded_weights(prefix + "time_text_embed.");
-    } else {
-      time_text_guidance_embed_->verify_loaded_weights(prefix +
-                                                       "time_text_embed.");
-    }
+    // time_embed (LongCat-Image specific - only timestep embedding)
+    time_embed_->verify_loaded_weights(prefix + "time_embed.");
     // transformer_blocks
     for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
       auto block = transformer_block_layers_[i];
@@ -1440,8 +1511,7 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
   bool guidance_embeds() { return guidance_embeds_; }
 
  private:
-  CombinedTimestepTextProjEmbeddings time_text_embed_{nullptr};
-  CombinedTimestepGuidanceTextProjEmbeddings time_text_guidance_embed_{nullptr};
+  LongCatImageTimestepEmbeddings time_embed_{nullptr};
   DiTLinear context_embedder_{nullptr};
   DiTLinear x_embedder_{nullptr};
   torch::nn::ModuleList transformer_blocks_{nullptr};
@@ -1498,6 +1568,257 @@ class FluxDiTModelImpl : public torch::nn::Module {
 };
 TORCH_MODULE(FluxDiTModel);
 
+class LongCatImageTransformer2DModelImpl : public torch::nn::Module {
+ public:
+  explicit LongCatImageTransformer2DModelImpl(const ModelContext& context)
+      : options_(context.get_tensor_options()) {
+    auto model_args = context.get_model_args();
+    auto num_attention_heads = model_args.n_heads();
+    auto attention_head_dim = model_args.head_dim();
+    auto inner_dim = num_attention_heads * attention_head_dim;
+    auto pooled_projection_dim = model_args.pooled_projection_dim();
+    auto joint_attention_dim = model_args.joint_attention_dim();
+    auto axes_dims_rope = model_args.axes_dims_rope();
+    auto num_layers = model_args.num_layers();
+    auto num_single_layers = model_args.num_single_layers();
+    auto patch_size = model_args.mm_patch_size();
+    in_channels_ = model_args.in_channels();
+    out_channels_ = model_args.out_channels();
+    guidance_embeds_ = model_args.guidance_embeds();
+
+    // Initialize the transformer model components
+    transformer_blocks_ =
+        register_module("transformer_blocks", torch::nn::ModuleList());
+    single_transformer_blocks_ =
+        register_module("single_transformer_blocks", torch::nn::ModuleList());
+
+    // LongCat-Image uses LongCatImageTimestepEmbeddings (only timestep, no
+    // text) Text embeddings are handled separately via pooled_projections
+    time_embed_ =
+        register_module("time_embed", LongCatImageTimestepEmbeddings(context));
+    context_embedder_ = register_module(
+        "context_embedder", DiTLinear(joint_attention_dim, inner_dim));
+    x_embedder_ =
+        register_module("x_embedder", DiTLinear(in_channels_, inner_dim));
+    context_embedder_->to(options_);
+    x_embedder_->to(options_);
+
+    // mm-dit block
+    transformer_block_layers_.reserve(num_layers);
+    for (int64_t i = 0; i < num_layers; ++i) {
+      auto block = FluxTransformerBlock(context);
+      transformer_blocks_->push_back(block);
+      transformer_block_layers_.push_back(block);
+    }
+
+    // single mm-dit block
+    single_transformer_block_layers_.reserve(num_single_layers);
+    for (int64_t i = 0; i < num_single_layers; ++i) {
+      auto block = FluxSingleTransformerBlock(context);
+      single_transformer_blocks_->push_back(block);
+      single_transformer_block_layers_.push_back(block);
+    }
+
+    norm_out_ = register_module("norm_out", AdaLayerNormContinuous(context));
+    proj_out_ = register_module(
+        "proj_out",
+        DiTLinear(inner_dim, patch_size * patch_size * out_channels_, true));
+    proj_out_->to(options_);
+  }
+
+  torch::Tensor forward(const torch::Tensor& hidden_states_input,
+                        const torch::Tensor& encoder_hidden_states_input,
+                        const torch::Tensor& pooled_projections,
+                        const torch::Tensor& timestep,
+                        const torch::Tensor& image_rotary_emb,
+                        const torch::Tensor& guidance,
+                        int64_t step_idx = 0) {
+    torch::Tensor hidden_states = x_embedder_->forward(hidden_states_input);
+
+    // Match Python: timestep = timestep.to(hidden_states.dtype) * 1000
+    // This is the timestep scaling used in the pipeline
+    auto timestep_scaled = timestep.to(hidden_states.dtype()) * 1000.0f;
+
+    // Get timestep embedding (LongCat-Image only has timestep, not text)
+    // Pass hidden_states.scalar_type() to ensure timestep embedding is in
+    // correct dtype
+    auto temb =
+        time_embed_->forward(timestep_scaled, hidden_states.scalar_type());
+
+    torch::Tensor encoder_hidden_states =
+        context_embedder_->forward(encoder_hidden_states_input);
+
+    bool use_step_cache = false;
+    bool use_block_cache = false;
+
+    torch::Tensor original_hidden_states = hidden_states;
+    torch::Tensor original_encoder_hidden_states = encoder_hidden_states;
+
+    // Step start: prepare inputs (hidden_states, original_hidden_states)
+    TensorMap step_in_map = {
+        {"hidden_states", hidden_states},
+        {"original_hidden_states", original_hidden_states}};
+    CacheStepIn stepin_before(step_idx, step_in_map);
+    use_step_cache = DiTCache::get_instance().on_before_step(stepin_before);
+
+    if (!use_step_cache) {
+      for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+        // Block start: prepare input (block_id)
+        CacheBlockIn blockin_before(i);
+        use_block_cache =
+            DiTCache::get_instance().on_before_block(blockin_before);
+
+        if (!use_block_cache) {
+          auto block = transformer_block_layers_[i];
+          auto [new_hidden, new_encoder_hidden] = block->forward(
+              hidden_states, encoder_hidden_states, temb, image_rotary_emb);
+          hidden_states = new_hidden;
+          encoder_hidden_states = new_encoder_hidden;
+        }
+
+        // Block end: update outputs (block_id, hidden_states,
+        // encoder_hidden_states, original_hidden_states,
+        // original_encoder_hidden_states)
+        TensorMap block_in_map = {
+            {"hidden_states", hidden_states},
+            {"encoder_hidden_states", encoder_hidden_states},
+            {"original_hidden_states", original_hidden_states},
+            {"original_encoder_hidden_states", original_encoder_hidden_states}};
+        CacheBlockIn blockin_after(i, block_in_map);
+        CacheBlockOut blockout_after =
+            DiTCache::get_instance().on_after_block(blockin_after);
+
+        hidden_states = blockout_after.tensors.at("hidden_states");
+        encoder_hidden_states =
+            blockout_after.tensors.at("encoder_hidden_states");
+      }
+
+      // For single transformer blocks, concat and split happens inside each
+      // block (to match Python LongCatImageSingleTransformerBlock behavior)
+      for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+        // Block start: prepare input (block_id)
+        CacheBlockIn blockin_before(i);
+        use_block_cache =
+            DiTCache::get_instance().on_before_block(blockin_before);
+
+        if (!use_block_cache) {
+          auto block = single_transformer_block_layers_[i];
+          // Single block internally concatenates and splits
+          auto [new_encoder_hidden, new_hidden] = block->forward(
+              hidden_states, encoder_hidden_states, temb, image_rotary_emb);
+          // Update both for next iteration
+          encoder_hidden_states = new_encoder_hidden;
+          hidden_states = new_hidden;
+        }
+
+        // Block end: update outputs (block_id, hidden_states,
+        // encoder_hidden_states, original_hidden_states,
+        // original_encoder_hidden_states)
+        TensorMap single_block_map = {
+            {"hidden_states", hidden_states},
+            {"encoder_hidden_states", encoder_hidden_states},
+            {"original_hidden_states", original_hidden_states},
+            {"original_encoder_hidden_states", original_encoder_hidden_states}};
+        CacheBlockIn blockin_after(i, single_block_map);
+        CacheBlockOut blockout_after =
+            DiTCache::get_instance().on_after_block(blockin_after);
+
+        hidden_states = blockout_after.tensors.at("hidden_states");
+        encoder_hidden_states =
+            blockout_after.tensors.at("encoder_hidden_states");
+      }
+    }
+
+    // Step end: update outputs (hidden_states, original_hidden_states)
+    TensorMap step_after_map = {
+        {"hidden_states", hidden_states},
+        {"original_hidden_states", original_hidden_states}};
+    CacheStepIn stepin_after(step_idx, step_after_map);
+    CacheStepOut stepout_after =
+        DiTCache::get_instance().on_after_step(stepin_after);
+    hidden_states = stepout_after.tensors.at("hidden_states");
+
+    auto output_hidden = norm_out_(hidden_states, temb);
+    return proj_out_(output_hidden);
+  }
+
+  void load_model(std::unique_ptr<DiTFolderLoader> loader) {
+    // Load model parameters from the loader
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      // context_embedder
+      context_embedder_->load_state_dict(
+          state_dict->get_dict_with_prefix("context_embedder."));
+      // x_embedder
+      x_embedder_->load_state_dict(
+          state_dict->get_dict_with_prefix("x_embedder."));
+      // time_embed (LongCat-Image specific - only timestep embedding)
+      time_embed_->load_state_dict(
+          state_dict->get_dict_with_prefix("time_embed."));
+      // transformer_blocks
+      for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+        auto block = transformer_block_layers_[i];
+        block->load_state_dict(state_dict->get_dict_with_prefix(
+            "transformer_blocks." + std::to_string(i) + "."));
+      }
+      // single_transformer_blocks
+      for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+        auto block = single_transformer_block_layers_[i];
+        block->load_state_dict(state_dict->get_dict_with_prefix(
+            "single_transformer_blocks." + std::to_string(i) + "."));
+      }
+      // norm_out
+      norm_out_->load_state_dict(state_dict->get_dict_with_prefix("norm_out."));
+      // proj_out
+      proj_out_->load_state_dict(state_dict->get_dict_with_prefix("proj_out."));
+    }
+  }
+
+  void verify_loaded_weights(const std::string& prefix) {
+    // context_embedder
+    context_embedder_->verify_loaded_weights(prefix + "context_embedder.");
+    // x_embedder
+    x_embedder_->verify_loaded_weights(prefix + "x_embedder.");
+    // time_embed (LongCat-Image specific - only timestep embedding)
+    time_embed_->verify_loaded_weights(prefix + "time_embed.");
+    // transformer_blocks
+    for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+      auto block = transformer_block_layers_[i];
+      block->verify_loaded_weights(prefix + "transformer_blocks." +
+                                   std::to_string(i) + ".");
+    }
+    // single_transformer_blocks
+    for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+      auto block = single_transformer_block_layers_[i];
+      block->verify_loaded_weights(prefix + "single_transformer_blocks." +
+                                   std::to_string(i) + ".");
+    }
+    // norm_out
+    norm_out_->verify_loaded_weights(prefix + "norm_out.");
+    // proj_out
+    proj_out_->verify_loaded_weights(prefix + "proj_out.");
+  }
+
+  int64_t in_channels() { return in_channels_; }
+  bool guidance_embeds() { return guidance_embeds_; }
+
+ private:
+  LongCatImageTimestepEmbeddings time_embed_{nullptr};
+  DiTLinear context_embedder_{nullptr};
+  DiTLinear x_embedder_{nullptr};
+  torch::nn::ModuleList transformer_blocks_{nullptr};
+  std::vector<FluxTransformerBlock> transformer_block_layers_;
+  torch::nn::ModuleList single_transformer_blocks_{nullptr};
+  std::vector<FluxSingleTransformerBlock> single_transformer_block_layers_;
+  AdaLayerNormContinuous norm_out_{nullptr};
+  DiTLinear proj_out_{nullptr};
+  bool guidance_embeds_;
+  int64_t in_channels_;
+  int64_t out_channels_;
+  torch::TensorOptions options_;
+};
+TORCH_MODULE(LongCatImageTransformer2DModel);
+
+// Note: This is for FluxTransformer2DModel (Flux model), not LongCat-Image
 REGISTER_MODEL_ARGS(FluxTransformer2DModel, [&] {
   LOAD_ARG_OR(dtype, "dtype", "bfloat16");
   LOAD_ARG_OR(mm_patch_size, "patch_size", 1);
@@ -1513,4 +1834,40 @@ REGISTER_MODEL_ARGS(FluxTransformer2DModel, [&] {
   LOAD_ARG_OR(
       axes_dims_rope, "axes_dims_rope", (std::vector<int64_t>{16, 56, 56}));
 });
+
+// Register model args loader for LongCatImageTransformer2DModel
+// Note: Direct registration since "LongCatImageTransformer2DModel" contains
+// special chars
+// LongCat-Image specific parameters (from
+// longcat-image/transformer/config.json)
+namespace {
+const bool longcat_image_transformer_args_registered = []() {
+  ModelRegistry::register_model_args_loader(
+      "LongCatImageTransformer2DModel",
+      [](const JsonReader& json, ModelArgs* args) {
+        UNUSED_PARAMETER(json);
+        UNUSED_PARAMETER(args);
+        LOAD_ARG_OR(dtype, "dtype", "bfloat16");
+        LOAD_ARG_OR(mm_patch_size, "patch_size", 1);
+        LOAD_ARG_OR(in_channels, "in_channels", 64);
+        LOAD_ARG_OR(out_channels, "out_channels", 64);
+        // LongCat-Image has 10 transformer blocks and 20 single blocks
+        LOAD_ARG_OR(num_layers, "num_layers", 10);
+        LOAD_ARG_OR(num_single_layers, "num_single_layers", 20);
+        LOAD_ARG_OR(head_dim, "attention_head_dim", 128);
+        LOAD_ARG_OR(n_heads, "num_attention_heads", 24);
+        // LongCat-Image uses 3584 for both joint and pooled dims (from
+        // Qwen2_5_VL hidden_size)
+        LOAD_ARG_OR(joint_attention_dim, "joint_attention_dim", 3584);
+        LOAD_ARG_OR(pooled_projection_dim, "pooled_projection_dim", 3584);
+        LOAD_ARG_OR(guidance_embeds, "guidance_embeds", false);
+        LOAD_ARG_OR(axes_dims_rope,
+                    "axes_dims_rope",
+                    (std::vector<int64_t>{16, 56, 56}));
+        return true;
+      });
+  return true;
+}();
+}  // namespace
+
 }  // namespace xllm

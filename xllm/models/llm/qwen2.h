@@ -88,6 +88,17 @@ class QWen2ForCausalLMImpl : public LlmForCausalLMImplBase<QWen2Model> {
  public:
   QWen2ForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<QWen2Model>(context) {}
+
+  // Load state dict for model and lm_head components
+  void load_state_dict(const StateDict& state_dict) {
+    model_->load_state_dict(state_dict.get_dict_with_prefix("model."));
+    if (tie_word_embeddings) {
+      lm_head_->load_state_dict(
+          state_dict.get_dict_with_prefix("model.embed_tokens."));
+    } else {
+      lm_head_->load_state_dict(state_dict.get_dict_with_prefix("lm_head."));
+    }
+  }
 };
 TORCH_MODULE(QWen2ForCausalLM);
 
