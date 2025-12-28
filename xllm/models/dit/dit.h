@@ -1513,4 +1513,35 @@ REGISTER_MODEL_ARGS(FluxTransformer2DModel, [&] {
   LOAD_ARG_OR(
       axes_dims_rope, "axes_dims_rope", (std::vector<int64_t>{16, 56, 56}));
 });
+
+// Register model args loader for LongCatImageTransformer2DModel
+// Note: Direct registration since "LongCatImageTransformer2DModel" contains
+// special chars
+namespace {
+const bool longcat_image_transformer_args_registered = []() {
+  ModelRegistry::register_model_args_loader(
+      "LongCatImageTransformer2DModel",
+      [](const JsonReader& json, ModelArgs* args) {
+        UNUSED_PARAMETER(json);
+        UNUSED_PARAMETER(args);
+        LOAD_ARG_OR(dtype, "dtype", "bfloat16");
+        LOAD_ARG_OR(mm_patch_size, "patch_size", 1);
+        LOAD_ARG_OR(in_channels, "in_channels", 64);
+        LOAD_ARG_OR(out_channels, "out_channels", 64);
+        LOAD_ARG_OR(num_layers, "num_layers", 19);
+        LOAD_ARG_OR(num_single_layers, "num_single_layers", 38);
+        LOAD_ARG_OR(head_dim, "attention_head_dim", 128);
+        LOAD_ARG_OR(n_heads, "num_attention_heads", 24);
+        LOAD_ARG_OR(joint_attention_dim, "joint_attention_dim", 4096);
+        LOAD_ARG_OR(pooled_projection_dim, "pooled_projection_dim", 768);
+        LOAD_ARG_OR(guidance_embeds, "guidance_embeds", true);
+        LOAD_ARG_OR(axes_dims_rope,
+                    "axes_dims_rope",
+                    (std::vector<int64_t>{16, 56, 56}));
+        return true;
+      });
+  return true;
+}();
+}  // namespace
+
 }  // namespace xllm
