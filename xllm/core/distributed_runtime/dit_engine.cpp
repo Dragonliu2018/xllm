@@ -22,6 +22,7 @@ limitations under the License.
 #include "core/common/metrics.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "runtime/forward_params.h"
 #include "runtime/worker.h"
 #include "util/env_var.h"
 #include "util/timer.h"
@@ -145,4 +146,32 @@ std::vector<int64_t> DiTEngine::get_active_activation_memory() const {
   }
   return active_activation_memories;
 }
+
+// Implementation of Engine interface methods
+ForwardOutput DiTEngine::step(std::vector<Batch>& batch) {
+  // Convert Batch to DiTBatch
+  std::vector<DiTBatch> dit_batches;
+  for (auto& b : batch) {
+    // TODO: Implement proper conversion from Batch to DiTBatch
+    // For now, create empty DiTBatch as placeholder
+    dit_batches.emplace_back();
+  }
+
+  // Call DiT-specific step method
+  auto dit_output = step(dit_batches);
+
+  // Convert DiTForwardOutput to ForwardOutput
+  ForwardOutput output;
+  // TODO: Implement proper conversion from DiTForwardOutput to ForwardOutput
+  // For now, return empty ForwardOutput as placeholder
+  return output;
+}
+
+void DiTEngine::update_last_step_result(std::vector<Batch>& batch) {
+  // TODO: Implement update_last_step_result for DiT
+  // This method should update the batch with the results from the last step
+  LOG(INFO)
+      << "DiTEngine::update_last_step_result called (not fully implemented)";
+}
+
 }  // namespace xllm

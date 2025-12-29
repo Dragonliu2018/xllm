@@ -19,29 +19,35 @@ limitations under the License.
 #include <gflags/gflags.h>
 
 #include <memory>
+#include <vector>
 
 #include "common/macros.h"
+#include "engine.h"
+#include "framework/batch/batch.h"
 #include "framework/batch/dit_batch.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/quant_args.h"
+#include "runtime/dit_forward_params.h"
 #include "runtime/dit_worker.h"
+#include "runtime/options.h"
 
 namespace xllm {
 
-class DiTEngine {
+class DiTEngine : public Engine {
  public:
   DiTEngine(const runtime::Options& options);
 
   ~DiTEngine() = default;
 
+  // Engine interface implementation
+  ForwardOutput step(std::vector<Batch>& batch) override;
+  void update_last_step_result(std::vector<Batch>& batch) override;
+  std::vector<int64_t> get_active_activation_memory() const override;
+
+  // DiT-specific methods
   DiTForwardOutput step(std::vector<DiTBatch>& batch);
-
   const runtime::Options& options() const { return options_; }
-
-  bool init();
-
-  // return the active activation memory
-  std::vector<int64_t> get_active_activation_memory() const;
+  bool init() override;
 
  private:
   bool init_model();

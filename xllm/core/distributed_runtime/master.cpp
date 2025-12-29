@@ -291,7 +291,7 @@ Master::Master(const Options& options, EngineType type) : options_(options) {
     if (options_.device_ip().has_value()) {
       eng_options.device_ip(options_.device_ip().value());
     }
-    engine_ = std::make_unique<DITEngine>(eng_options);
+    engine_ = std::make_unique<DiTEngine>(eng_options);
   } else {
     LOG(WARNING) << "Not supported llm engine type: "
                  << static_cast<size_t>(type);
