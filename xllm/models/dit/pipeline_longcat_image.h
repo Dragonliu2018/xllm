@@ -458,10 +458,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                            negative_pooled_prompt_embeds.has_value());
     bool do_true_cfg = (true_cfg_scale > 1.0f) && has_neg_prompt;
 
-    // TODO: Encode prompt using VLM text encoder
-    // For now, use dummy embeddings
-    LOG(WARNING)
-        << "Using dummy text embeddings - VLM text encoder not implemented";
+    // Encode prompt using VLM text encoder
     torch::Tensor encoded_prompt_embeds;
     torch::Tensor encoded_pooled_embeds;
     torch::Tensor text_ids;
@@ -470,20 +467,85 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       encoded_prompt_embeds = prompt_embeds.value();
       encoded_pooled_embeds = pooled_prompt_embeds.value();
     } else {
-      // Create dummy embeddings for testing
-      // Note: We need to get transformer args from the model context
-      // For now, use hardcoded values based on LongCat-Image config
-      int64_t hidden_size = 3584;  // joint_attention_dim from config
-      int64_t pooled_projection_dim =
-          3584;  // pooled_projection_dim from config
-      encoded_prompt_embeds = torch::zeros(
-          {total_batch_size, max_sequence_length, hidden_size}, options_);
-      encoded_pooled_embeds = torch::zeros(
-          at::IntArrayRef({total_batch_size, pooled_projection_dim}), options_);
+      // Use VLM text encoder to encode prompts
+      if (text_encoder_ && prompt.has_value()) {
+        LOG(INFO) << "Encoding prompts using VLM text encoder";
+        try {
+          // Tokenize prompts
+          std::vector<std::vector<int32_t>> text_input_ids;
+          text_input_ids.reserve(total_batch_size);
+
+          // Repeat prompts for num_images_per_prompt
+          std::vector<std::string> repeated_prompts;
+          for (const auto& p : prompt.value()) {
+            for (int64_t i = 0; i < generation_params.num_images_per_prompt;
+                 ++i) {
+              repeated_prompts.push_back(p);
+            }
+          }
+
+          if (tokenizer_ &&
+              tokenizer_->batch_encode(repeated_prompts, &text_input_ids)) {
+            // Truncate or pad to max_sequence_length
+            for (auto& ids : text_input_ids) {
+              if (ids.size() > max_sequence_length) {
+                ids.resize(max_sequence_length);
+              } else if (ids.size() < max_sequence_length) {
+                ids.resize(max_sequence_length, 0);  // Pad with 0
+              }
+            }
+
+            // Convert to tensor
+            std::vector<int32_t> input_ids_flat;
+            input_ids_flat.reserve(total_batch_size * max_sequence_length);
+            for (const auto& ids : text_input_ids) {
+              input_ids_flat.insert(
+                  input_ids_flat.end(), ids.begin(), ids.end());
+            }
+
+            auto input_ids =
+                torch::tensor(input_ids_flat, torch::dtype(torch::kLong))
+                    .view({total_batch_size, max_sequence_length})
+                    .to(options_.device());
+
+            // Encode using VLM text encoder
+            torch::NoGradGuard no_grad;
+            auto encoder_output = text_encoder_->forward(input_ids);
+
+            // Extract the last hidden states and pooled output
+            encoded_prompt_embeds = encoder_output.last_hidden_state;
+            // Use mean pooling as pooled embeddings
+            encoded_pooled_embeds = encoder_output.last_hidden_state.mean(1);
+
+            LOG(INFO) << "VLM text encoding successful, output shapes: "
+                      << encoded_prompt_embeds.sizes() << ", "
+                      << encoded_pooled_embeds.sizes();
+          } else {
+            throw std::runtime_error("Failed to tokenize prompts");
+          }
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "VLM text encoding failed: " << e.what()
+                       << ", falling back to dummy embeddings";
+          goto use_dummy_embeddings;
+        }
+      } else {
+      use_dummy_embeddings:
+        LOG(WARNING)
+            << "Using dummy text embeddings - VLM text encoder not available";
+        // Create dummy embeddings for testing
+        int64_t hidden_size = 3584;  // joint_attention_dim from config
+        int64_t pooled_projection_dim =
+            3584;  // pooled_projection_dim from config
+        encoded_prompt_embeds = torch::zeros(
+            {total_batch_size, max_sequence_length, hidden_size}, options_);
+        encoded_pooled_embeds = torch::zeros(
+            at::IntArrayRef({total_batch_size, pooled_projection_dim}),
+            options_);
+      }
     }
 
     text_ids =
-        torch::zeros({total_batch_size, max_sequence_length, 3},
+        torch::zeros({max_sequence_length, 3},
                      torch::dtype(torch::kLong).device(options_.device()));
 
     // encode negative prompt
@@ -504,7 +566,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             options_);
       }
       negative_text_ids =
-          torch::zeros({total_batch_size, max_sequence_length, 3},
+          torch::zeros({max_sequence_length, 3},
                        torch::dtype(torch::kLong).device(options_.device()));
     }
 
