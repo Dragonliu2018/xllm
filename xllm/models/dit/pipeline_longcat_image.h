@@ -195,13 +195,6 @@ std::pair<torch::Tensor, int64_t> retrieve_timesteps(
   return {scheduler_timesteps, steps};
 }
 
-torch::Tensor randn_tensor(std::vector<int64_t> shape,
-                           int64_t seed,
-                           torch::TensorOptions options) {
-  torch::manual_seed(seed);
-  return torch::randn(shape, options);
-}
-
 torch::Tensor pack_latents(torch::Tensor latents,
                            int64_t batch_size,
                            int64_t num_channels_latents,
@@ -236,11 +229,12 @@ torch::Tensor unpack_latents(torch::Tensor latents,
 
 torch::Tensor prepare_latent_image_ids(int64_t batch_size,
                                        int64_t height,
-                                       int64_t width) {
-  torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options_);
-  torch::Tensor height_range = torch::arange(height, options_).unsqueeze(1);
+                                       int64_t width,
+                                       const torch::TensorOptions& options) {
+  torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options);
+  torch::Tensor height_range = torch::arange(height, options).unsqueeze(1);
   latent_image_ids.select(2, 1) += height_range;
-  torch::Tensor width_range = torch::arange(width, options_).unsqueeze(0);
+  torch::Tensor width_range = torch::arange(width, options).unsqueeze(0);
   latent_image_ids.select(2, 2) += width_range;
   latent_image_ids = latent_image_ids.view({height * width, 3});
   return latent_image_ids;
@@ -258,29 +252,42 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     tokenizer_max_length_ =
         context.get_model_args("text_encoder").max_position_embeddings();
     LOG(INFO) << "Initializing LongCat-Image pipeline...";
-    vae_image_processor_ = VAEImageProcessor(context.get_model_context("vae"),
-                                             true,
-                                             true,
-                                             false,
-                                             false,
-                                             false,
-                                             model_args.latent_channels());
-    vae_ = VAE(context.get_model_context("vae"));
+    vae_image_processor_ =
+        VAEImageProcessor(ModelContext(context.get_parallel_args(),
+                                       context.get_model_args("vae"),
+                                       context.get_quant_args("vae"),
+                                       context.get_tensor_options()),
+                          true,
+                          true,
+                          false,
+                          false,
+                          false,
+                          model_args.latent_channels());
+    vae_ = VAE(ModelContext(context.get_parallel_args(),
+                            context.get_model_args("vae"),
+                            context.get_quant_args("vae"),
+                            context.get_tensor_options()));
     pos_embed_ = register_module(
         "pos_embed",
         LongCatImagePosEmbed(
             ROPE_SCALE_BASE,
             context.get_model_args("transformer").axes_dims_rope()));
-    transformer_ =
-        FluxTransformer2DModel(context.get_model_context("transformer"));
+    transformer_ = LongCatImageTransformer2DModel(
+        ModelContext(context.get_parallel_args(),
+                     context.get_model_args("transformer"),
+                     context.get_quant_args("transformer"),
+                     context.get_tensor_options()));
 
     // LongCat-Image uses Qwen2_5_VL as text encoder, not CLIP+T5
     // For now, we load it as text_encoder
     // TODO: Integrate VLM model for text encoding
     LOG(INFO) << "LongCat-Image uses Qwen2_5_VL as text encoder";
 
-    scheduler_ =
-        FlowMatchEulerDiscreteScheduler(context.get_model_context("scheduler"));
+    scheduler_ = FlowMatchEulerDiscreteScheduler(
+        ModelContext(context.get_parallel_args(),
+                     context.get_model_args("scheduler"),
+                     context.get_quant_args("scheduler"),
+                     context.get_tensor_options()));
     register_module("vae", vae_);
     register_module("vae_image_processor", vae_image_processor_);
     register_module("transformer", transformer_);
@@ -389,7 +396,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   VAEImageProcessor vae_image_processor_{nullptr};
   VAE vae_{nullptr};
   LongCatImagePosEmbed pos_embed_{nullptr};
-  FluxTransformer2DModel transformer_{nullptr};
+  LongCatImageTransformer2DModel transformer_{nullptr};
   FlowMatchEulerDiscreteScheduler scheduler_{nullptr};
   std::unique_ptr<Tokenizer> tokenizer_;
 
@@ -406,7 +413,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         batch_size, num_channels_latents, adjusted_height, adjusted_width};
     if (latents.has_value()) {
       torch::Tensor latent_image_ids = prepare_latent_image_ids(
-          batch_size, adjusted_height / 2, adjusted_width / 2);
+          batch_size, adjusted_height / 2, adjusted_width / 2, options_);
       return {latents.value(), latent_image_ids};
     }
     torch::Tensor latents_tensor = randn_tensor(shape, seed, options_);
@@ -416,7 +423,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                                 adjusted_height,
                                                 adjusted_width);
     torch::Tensor latent_image_ids = prepare_latent_image_ids(
-        batch_size, adjusted_height / 2, adjusted_width / 2);
+        batch_size, adjusted_height / 2, adjusted_width / 2, options_);
     return {packed_latents, latent_image_ids};
   }
 
@@ -464,11 +471,15 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       encoded_pooled_embeds = pooled_prompt_embeds.value();
     } else {
       // Create dummy embeddings for testing
-      int64_t hidden_size = transformer_->joint_attention_dim();
+      // Note: We need to get transformer args from the model context
+      // For now, use hardcoded values based on LongCat-Image config
+      int64_t hidden_size = 3584;  // joint_attention_dim from config
+      int64_t pooled_projection_dim =
+          3584;  // pooled_projection_dim from config
       encoded_prompt_embeds = torch::zeros(
           {total_batch_size, max_sequence_length, hidden_size}, options_);
       encoded_pooled_embeds = torch::zeros(
-          {total_batch_size, transformer_->pooled_projection_dim()}, options_);
+          at::IntArrayRef({total_batch_size, pooled_projection_dim}), options_);
     }
 
     text_ids =
@@ -483,11 +494,13 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         negative_encoded_embeds = negative_prompt_embeds.value();
         negative_pooled_embeds = negative_pooled_prompt_embeds.value();
       } else {
-        int64_t hidden_size = transformer_->joint_attention_dim();
+        int64_t hidden_size = 3584;  // joint_attention_dim from config
+        int64_t pooled_projection_dim =
+            3584;  // pooled_projection_dim from config
         negative_encoded_embeds = torch::zeros(
             {total_batch_size, max_sequence_length, hidden_size}, options_);
         negative_pooled_embeds = torch::zeros(
-            {total_batch_size, transformer_->pooled_projection_dim()},
+            at::IntArrayRef({total_batch_size, pooled_projection_dim}),
             options_);
       }
       negative_text_ids =

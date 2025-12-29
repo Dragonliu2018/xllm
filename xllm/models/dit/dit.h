@@ -1498,6 +1498,270 @@ class FluxDiTModelImpl : public torch::nn::Module {
 };
 TORCH_MODULE(FluxDiTModel);
 
+class LongCatImageTransformer2DModelImpl : public torch::nn::Module {
+ public:
+  explicit LongCatImageTransformer2DModelImpl(const ModelContext& context)
+      : options_(context.get_tensor_options()) {
+    auto model_args = context.get_model_args();
+    auto num_attention_heads = model_args.n_heads();
+    auto attention_head_dim = model_args.head_dim();
+    auto inner_dim = num_attention_heads * attention_head_dim;
+    auto pooled_projection_dim = model_args.pooled_projection_dim();
+    auto joint_attention_dim = model_args.joint_attention_dim();
+    auto axes_dims_rope = model_args.axes_dims_rope();
+    auto num_layers = model_args.num_layers();
+    auto num_single_layers = model_args.num_single_layers();
+    auto patch_size = model_args.mm_patch_size();
+    in_channels_ = model_args.in_channels();
+    out_channels_ = model_args.out_channels();
+    guidance_embeds_ = model_args.guidance_embeds();
+
+    // Initialize the transformer model components
+    transformer_blocks_ =
+        register_module("transformer_blocks", torch::nn::ModuleList());
+    single_transformer_blocks_ =
+        register_module("single_transformer_blocks", torch::nn::ModuleList());
+
+    // LongCat-Image has guidance_embeds=false, so only use time_text_embed
+    if (guidance_embeds_) {
+      time_text_guidance_embed_ =
+          register_module("time_text_guidance_embed",
+                          CombinedTimestepGuidanceTextProjEmbeddings(context));
+    } else {
+      time_text_embed_ = register_module(
+          "time_text_embed", CombinedTimestepTextProjEmbeddings(context));
+    }
+    context_embedder_ = register_module(
+        "context_embedder", DiTLinear(joint_attention_dim, inner_dim));
+    x_embedder_ =
+        register_module("x_embedder", DiTLinear(in_channels_, inner_dim));
+    context_embedder_->to(options_);
+    x_embedder_->to(options_);
+
+    // mm-dit block
+    transformer_block_layers_.reserve(num_layers);
+    for (int64_t i = 0; i < num_layers; ++i) {
+      auto block = FluxTransformerBlock(context);
+      transformer_blocks_->push_back(block);
+      transformer_block_layers_.push_back(block);
+    }
+
+    // single mm-dit block
+    single_transformer_block_layers_.reserve(num_single_layers);
+    for (int64_t i = 0; i < num_single_layers; ++i) {
+      auto block = FluxSingleTransformerBlock(context);
+      single_transformer_blocks_->push_back(block);
+      single_transformer_block_layers_.push_back(block);
+    }
+
+    norm_out_ = register_module("norm_out", AdaLayerNormContinuous(context));
+    proj_out_ = register_module(
+        "proj_out",
+        DiTLinear(inner_dim, patch_size * patch_size * out_channels_, true));
+    proj_out_->to(options_);
+  }
+
+  torch::Tensor forward(const torch::Tensor& hidden_states_input,
+                        const torch::Tensor& encoder_hidden_states_input,
+                        const torch::Tensor& pooled_projections,
+                        const torch::Tensor& timestep,
+                        const torch::Tensor& image_rotary_emb,
+                        const torch::Tensor& guidance,
+                        int64_t step_idx = 0) {
+    torch::Tensor hidden_states = x_embedder_->forward(hidden_states_input);
+    auto timestep_scaled = timestep.to(hidden_states.dtype()) * 1000.0f;
+    torch::Tensor temb;
+
+    // LongCat-Image uses guidance_embeds=false, so guidance tensor is typically
+    // undefined
+    if (guidance.defined() && guidance_embeds_) {
+      auto guidance_scaled = guidance.to(hidden_states.dtype()) * 1000.0f;
+      temb = time_text_guidance_embed_->forward(
+          timestep_scaled, guidance_scaled, pooled_projections);
+    } else {
+      temb = time_text_embed_->forward(timestep_scaled, pooled_projections);
+    }
+
+    torch::Tensor encoder_hidden_states =
+        context_embedder_->forward(encoder_hidden_states_input);
+
+    bool use_step_cache = false;
+    bool use_block_cache = false;
+
+    torch::Tensor original_hidden_states = hidden_states;
+    torch::Tensor original_encoder_hidden_states = encoder_hidden_states;
+
+    // Step start: prepare inputs (hidden_states, original_hidden_states)
+    TensorMap step_in_map = {
+        {"hidden_states", hidden_states},
+        {"original_hidden_states", original_hidden_states}};
+    CacheStepIn stepin_before(step_idx, step_in_map);
+    use_step_cache = DiTCache::get_instance().on_before_step(stepin_before);
+
+    if (!use_step_cache) {
+      for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+        // Block start: prepare input (block_id)
+        CacheBlockIn blockin_before(i);
+        use_block_cache =
+            DiTCache::get_instance().on_before_block(blockin_before);
+
+        if (!use_block_cache) {
+          auto block = transformer_block_layers_[i];
+          auto [new_hidden, new_encoder_hidden] = block->forward(
+              hidden_states, encoder_hidden_states, temb, image_rotary_emb);
+          hidden_states = new_hidden;
+          encoder_hidden_states = new_encoder_hidden;
+        }
+
+        // Block end: update outputs (block_id, hidden_states,
+        // encoder_hidden_states, original_hidden_states,
+        // original_encoder_hidden_states)
+        TensorMap block_in_map = {
+            {"hidden_states", hidden_states},
+            {"encoder_hidden_states", encoder_hidden_states},
+            {"original_hidden_states", original_hidden_states},
+            {"original_encoder_hidden_states", original_encoder_hidden_states}};
+        CacheBlockIn blockin_after(i, block_in_map);
+        CacheBlockOut blockout_after =
+            DiTCache::get_instance().on_after_block(blockin_after);
+
+        hidden_states = blockout_after.tensors.at("hidden_states");
+        encoder_hidden_states =
+            blockout_after.tensors.at("encoder_hidden_states");
+      }
+
+      hidden_states = torch::cat({encoder_hidden_states, hidden_states}, 1);
+
+      for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+        // Block start: prepare input (block_id)
+        CacheBlockIn blockin_before(i);
+        use_block_cache =
+            DiTCache::get_instance().on_before_block(blockin_before);
+
+        if (!use_block_cache) {
+          auto block = single_transformer_block_layers_[i];
+          hidden_states = block->forward(hidden_states, temb, image_rotary_emb);
+        }
+
+        // Block end: update outputs (block_id, hidden_states,
+        // original_hidden_states)
+        TensorMap single_block_map = {
+            {"hidden_states", hidden_states},
+            {"original_hidden_states", original_hidden_states}};
+        CacheBlockIn blockin_after(i, single_block_map);
+        CacheBlockOut blockout_after =
+            DiTCache::get_instance().on_after_block(blockin_after);
+
+        hidden_states = blockout_after.tensors.at("hidden_states");
+      }
+
+      int64_t start = encoder_hidden_states.size(1);
+      int64_t length = hidden_states.size(1) - start;
+      auto output_hidden =
+          hidden_states.narrow(1, start, std::max(length, int64_t(0)));
+      hidden_states = output_hidden;
+    }
+
+    // Step end: update outputs (hidden_states, original_hidden_states)
+    TensorMap step_after_map = {
+        {"hidden_states", hidden_states},
+        {"original_hidden_states", original_hidden_states}};
+    CacheStepIn stepin_after(step_idx, step_after_map);
+    CacheStepOut stepout_after =
+        DiTCache::get_instance().on_after_step(stepin_after);
+    hidden_states = stepout_after.tensors.at("hidden_states");
+
+    auto output_hidden = norm_out_(hidden_states, temb);
+    return proj_out_(output_hidden);
+  }
+
+  void load_model(std::unique_ptr<DiTFolderLoader> loader) {
+    // Load model parameters from the loader
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      // context_embedder
+      context_embedder_->load_state_dict(
+          state_dict->get_dict_with_prefix("context_embedder."));
+      // x_embedder
+      x_embedder_->load_state_dict(
+          state_dict->get_dict_with_prefix("x_embedder."));
+      // time_text_embed
+      if (time_text_embed_) {
+        time_text_embed_->load_state_dict(
+            state_dict->get_dict_with_prefix("time_text_embed."));
+      } else {
+        time_text_guidance_embed_->load_state_dict(
+            state_dict->get_dict_with_prefix("time_text_embed."));
+      }
+      // transformer_blocks
+      for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+        auto block = transformer_block_layers_[i];
+        block->load_state_dict(state_dict->get_dict_with_prefix(
+            "transformer_blocks." + std::to_string(i) + "."));
+      }
+      // single_transformer_blocks
+      for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+        auto block = single_transformer_block_layers_[i];
+        block->load_state_dict(state_dict->get_dict_with_prefix(
+            "single_transformer_blocks." + std::to_string(i) + "."));
+      }
+      // norm_out
+      norm_out_->load_state_dict(state_dict->get_dict_with_prefix("norm_out."));
+      // proj_out
+      proj_out_->load_state_dict(state_dict->get_dict_with_prefix("proj_out."));
+    }
+  }
+
+  void verify_loaded_weights(const std::string& prefix) {
+    // context_embedder
+    context_embedder_->verify_loaded_weights(prefix + "context_embedder.");
+    // x_embedder
+    x_embedder_->verify_loaded_weights(prefix + "x_embedder.");
+    // time_text_embed
+    if (time_text_embed_) {
+      time_text_embed_->verify_loaded_weights(prefix + "time_text_embed.");
+    } else {
+      time_text_guidance_embed_->verify_loaded_weights(prefix +
+                                                       "time_text_embed.");
+    }
+    // transformer_blocks
+    for (int64_t i = 0; i < transformer_block_layers_.size(); ++i) {
+      auto block = transformer_block_layers_[i];
+      block->verify_loaded_weights(prefix + "transformer_blocks." +
+                                   std::to_string(i) + ".");
+    }
+    // single_transformer_blocks
+    for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
+      auto block = single_transformer_block_layers_[i];
+      block->verify_loaded_weights(prefix + "single_transformer_blocks." +
+                                   std::to_string(i) + ".");
+    }
+    // norm_out
+    norm_out_->verify_loaded_weights(prefix + "norm_out.");
+    // proj_out
+    proj_out_->verify_loaded_weights(prefix + "proj_out.");
+  }
+
+  int64_t in_channels() { return in_channels_; }
+  bool guidance_embeds() { return guidance_embeds_; }
+
+ private:
+  CombinedTimestepTextProjEmbeddings time_text_embed_{nullptr};
+  CombinedTimestepGuidanceTextProjEmbeddings time_text_guidance_embed_{nullptr};
+  DiTLinear context_embedder_{nullptr};
+  DiTLinear x_embedder_{nullptr};
+  torch::nn::ModuleList transformer_blocks_{nullptr};
+  std::vector<FluxTransformerBlock> transformer_block_layers_;
+  torch::nn::ModuleList single_transformer_blocks_{nullptr};
+  std::vector<FluxSingleTransformerBlock> single_transformer_block_layers_;
+  AdaLayerNormContinuous norm_out_{nullptr};
+  DiTLinear proj_out_{nullptr};
+  bool guidance_embeds_;
+  int64_t in_channels_;
+  int64_t out_channels_;
+  torch::TensorOptions options_;
+};
+TORCH_MODULE(LongCatImageTransformer2DModel);
+
 REGISTER_MODEL_ARGS(FluxTransformer2DModel, [&] {
   LOAD_ARG_OR(dtype, "dtype", "bfloat16");
   LOAD_ARG_OR(mm_patch_size, "patch_size", 1);
