@@ -24,6 +24,7 @@ limitations under the License.
 #include "autoencoder_kl.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model_context.h"
+#include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/request/dit_request_state.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
@@ -373,10 +374,41 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     vae_->load_model(std::move(vae_loader));
     vae_->to(options_.device());
 
-    // TODO: Load VLM text encoder model
-    // For now, we skip loading the text encoder as it requires VLM
-    // integration
-    LOG(INFO) << "Text encoder (Qwen2_5_VL) loading is not yet implemented";
+    // Load VLM text encoder model (Qwen2_5_VL)
+    if (text_encoder_loader) {
+      LOG(INFO) << "Loading Qwen2_5_VL text encoder model...";
+      try {
+        auto all_model_args = loader->get_model_args();
+        auto all_quant_args = loader->get_quant_args();
+
+        auto text_encoder_args_iter = all_model_args.find("text_encoder");
+        auto text_encoder_quant_iter = all_quant_args.find("text_encoder");
+
+        if (text_encoder_args_iter != all_model_args.end() &&
+            text_encoder_quant_iter != all_quant_args.end()) {
+          text_encoder_ = Qwen2_5_VLForConditionalGeneration(
+              ModelContext(ParallelArgs(1, 1, nullptr),
+                           text_encoder_args_iter->second,
+                           text_encoder_quant_iter->second,
+                           options_));
+          text_encoder_->load_model(std::move(text_encoder_loader));
+          text_encoder_->to(options_.device());
+          LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
+        } else {
+          LOG(WARNING)
+              << "Text encoder model args not found, will use dummy embeddings";
+          text_encoder_ = nullptr;
+        }
+      } catch (const std::exception& e) {
+        LOG(WARNING) << "Failed to load Qwen2_5_VL text encoder: " << e.what()
+                     << ", will use dummy embeddings as fallback";
+        text_encoder_ = nullptr;
+      }
+    } else {
+      LOG(WARNING)
+          << "Text encoder loader not available, will use dummy embeddings";
+      text_encoder_ = nullptr;
+    }
 
     // Load tokenizer if available
     if (tokenizer_loader) {
