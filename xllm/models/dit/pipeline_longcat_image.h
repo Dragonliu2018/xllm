@@ -32,6 +32,7 @@ limitations under the License.
 #include "dit.h"
 #include "flowmatch_euler_discrete_scheduler.h"
 #include "models/model_registry.h"
+#include "models/vlm/qwen2_5_vl.h"
 
 // LongCat-Image pipeline implementation
 // Uses Qwen2_5_VL as text encoder instead of CLIP+T5
@@ -399,7 +400,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   LongCatImageTransformer2DModel transformer_{nullptr};
   FlowMatchEulerDiscreteScheduler scheduler_{nullptr};
   std::unique_ptr<Tokenizer> tokenizer_;
-  std::unique_ptr<torch::nn::Module> text_encoder_;
+  Qwen2_5_VLForConditionalGeneration text_encoder_{nullptr};
 
   std::pair<torch::Tensor, torch::Tensor> prepare_latents(
       int64_t batch_size,
@@ -510,12 +511,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
             // Encode using VLM text encoder
             torch::NoGradGuard no_grad;
-            auto encoder_output = text_encoder_->forward(input_ids);
+            // Get input embeddings from the language model
+            auto input_embeds = text_encoder_->get_input_embeddings(
+                input_ids, std::nullopt, std::nullopt, ModelInputParams());
 
-            // Extract the last hidden states and pooled output
-            encoded_prompt_embeds = encoder_output.last_hidden_state;
+            // Use the embeddings as prompt embeddings
+            encoded_prompt_embeds = input_embeds;
             // Use mean pooling as pooled embeddings
-            encoded_pooled_embeds = encoder_output.last_hidden_state.mean(1);
+            encoded_pooled_embeds = input_embeds.mean(1);
 
             LOG(INFO) << "VLM text encoding successful, output shapes: "
                       << encoded_prompt_embeds.sizes() << ", "
