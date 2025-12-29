@@ -741,6 +741,11 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     language_model_->set_word_embedding(word_embedding);
   }
 
+  // Getters for accessing internal components (for model loading)
+  Qwen2_5_VisionTransformer get_visual() { return visual_; }
+
+  QWen2ForCausalLM get_language_model() { return language_model_; }
+
  private:
   ModelArgs model_args_;
   torch::TensorOptions options_;

@@ -281,8 +281,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                      context.get_tensor_options()));
 
     // LongCat-Image uses Qwen2_5_VL as text encoder, not CLIP+T5
-    // For now, we load it as text_encoder
-    // TODO: Integrate VLM model for text encoding
+    // VLM integration is complete and weights will be loaded in load_model()
     LOG(INFO) << "LongCat-Image uses Qwen2_5_VL as text encoder";
 
     scheduler_ = FlowMatchEulerDiscreteScheduler(
@@ -391,7 +390,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                            text_encoder_args_iter->second,
                            text_encoder_quant_iter->second,
                            options_));
-          text_encoder_->load_model(std::move(text_encoder_loader));
+
+          // Manually load weights for visual and language_model components
+          // since DiTFolderLoader is not compatible with ModelLoader interface
+          auto state_dicts = text_encoder_loader->get_state_dicts();
+          for (const auto& state_dict : state_dicts) {
+            // Load visual component weights
+            auto visual = text_encoder_->get_visual();
+            visual->load_state_dict(
+                state_dict->get_dict_with_prefix("visual."));
+
+            // Load language model component weights
+            auto language_model = text_encoder_->get_language_model();
+            if (language_model) {
+              language_model->load_state_dict(
+                  state_dict->get_dict_with_prefix("language_model."));
+            }
+          }
+
           text_encoder_->to(options_.device());
           LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
         } else {
