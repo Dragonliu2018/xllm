@@ -53,9 +53,6 @@ limitations under the License.
 #include "vlm/qwen3_vl.h"      // IWYU pragma: keep
 #include "vlm/qwen3_vl_moe.h"  // IWYU pragma: keep
 #else
-#include "dit/pipeline_flux.h"           // IWYU pragma: keep
-#include "dit/pipeline_flux_control.h"   // IWYU pragma: keep
-#include "dit/pipeline_flux_fill.h"      // IWYU pragma: keep
 #include "dit/pipeline_longcat_image.h"  // IWYU pragma: keep
 #include "llm/qwen2.h"                   // IWYU pragma: keep
 #include "llm/qwen3.h"                   // IWYU pragma: keep
