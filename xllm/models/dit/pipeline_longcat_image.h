@@ -399,6 +399,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   LongCatImageTransformer2DModel transformer_{nullptr};
   FlowMatchEulerDiscreteScheduler scheduler_{nullptr};
   std::unique_ptr<Tokenizer> tokenizer_;
+  std::unique_ptr<torch::nn::Module> text_encoder_;
 
   std::pair<torch::Tensor, torch::Tensor> prepare_latents(
       int64_t batch_size,
@@ -478,8 +479,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           // Repeat prompts for num_images_per_prompt
           std::vector<std::string> repeated_prompts;
           for (const auto& p : prompt.value()) {
-            for (int64_t i = 0; i < generation_params.num_images_per_prompt;
-                 ++i) {
+            for (int64_t i = 0; i < num_images_per_prompt; ++i) {
               repeated_prompts.push_back(p);
             }
           }
