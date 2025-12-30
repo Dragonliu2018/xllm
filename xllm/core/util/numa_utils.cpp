@@ -116,8 +116,8 @@ int32_t get_device_numa_node(int32_t device_index) {
   // For CUDA devices, read from sysfs
   cudaDeviceProp prop;
   if (cudaGetDeviceProperties(&prop, device_index) == cudaSuccess) {
-    std::string numa_path =
-        "/sys/bus/pci/devices/" + std::string(prop.pciBusID) + "/numa_node";
+    std::string pci_bus_id(prop.pciBusID);
+    std::string numa_path = "/sys/bus/pci/devices/" + pci_bus_id + "/numa_node";
 
     std::ifstream numa_file(numa_path);
     if (numa_file.is_open()) {
