@@ -416,12 +416,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   void load_model(std::unique_ptr<DiTModelLoader> loader) {
     LOG(INFO) << "LongCat-Image pipeline loading model from "
               << loader->model_root_path();
+    LOG(INFO) << "[LongCatImage] Model weights path: "
+              << loader->model_root_path();
     std::string model_path = loader->model_root_path();
 
     // Get all model args BEFORE taking any component loaders
     // (because take_component_loader removes the loader from the map)
     auto all_model_args = loader->get_model_args();
     auto all_quant_args = loader->get_quant_args();
+    LOG(INFO) << "[LongCatImage] Model config args size: "
+              << all_model_args.size();
+    LOG(INFO) << "[LongCatImage] Quant config args size: "
+              << all_quant_args.size();
+    for (const auto& [key, value] : all_model_args) {
+      LOG(INFO) << "[LongCatImage] Model component: " << key;
+    }
+    for (const auto& [key, value] : all_quant_args) {
+      LOG(INFO) << "[LongCatImage] Quant component: " << key;
+    }
 
     auto transformer_loader = loader->take_component_loader("transformer");
     auto vae_loader = loader->take_component_loader("vae");
@@ -570,6 +582,21 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       std::optional<torch::Tensor> negative_pooled_prompt_embeds = std::nullopt,
       int64_t max_sequence_length = 512) {
     torch::NoGradGuard no_grad;
+    // 打印推理参数
+    LOG(INFO) << "[LongCatImage] Inference params: height=" << height
+              << ", width=" << width
+              << ", num_inference_steps=" << num_inference_steps
+              << ", guidance_scale=" << guidance_scale
+              << ", num_images_per_prompt=" << num_images_per_prompt
+              << ", seed="
+              << (seed.has_value() ? std::to_string(seed.value()) : "none")
+              << ", max_sequence_length=" << max_sequence_length;
+    if (prompt.has_value()) {
+      for (size_t i = 0; i < prompt.value().size(); ++i) {
+        LOG(INFO) << "[LongCatImage] Prompt[" << i
+                  << "]: " << prompt.value()[i];
+      }
+    }
     int64_t batch_size;
     if (prompt.has_value()) {
       batch_size = prompt.value().size();
@@ -644,6 +671,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
             LOG(INFO) << "VLM text encoding successful, output shapes: "
                       << encoded_prompt_embeds.sizes() << ", "
+                      << encoded_pooled_embeds.sizes();
+            LOG(INFO) << "[LongCatImage] Encoded prompt_embeds shape: "
+                      << encoded_prompt_embeds.sizes();
+            LOG(INFO) << "[LongCatImage] Encoded pooled_embeds shape: "
                       << encoded_pooled_embeds.sizes();
           } else {
             throw std::runtime_error("Failed to tokenize prompts");
@@ -793,6 +824,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     unpacked_latents = unpacked_latents.to(options_.dtype());
     image = vae_->decode(unpacked_latents);
     image = vae_image_processor_->postprocess(image);
+    LOG(INFO) << "[LongCatImage] Generated image tensor shape: "
+              << image.sizes();
+    LOG(INFO) << "[LongCatImage] Image tensor min/max: "
+              << image.min().item<float>() << "/" << image.max().item<float>();
     return std::vector<torch::Tensor>{{image}};
   }
 };
