@@ -730,6 +730,19 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     }
   }
 
+  // Load state dict for both visual and language_model components
+  void load_state_dict(const StateDict& state_dict) {
+    // Load visual component weights
+    visual_->load_state_dict(state_dict.get_dict_with_prefix("visual."));
+
+    // Load language model component weights
+    auto language_model = language_model_;
+    if (language_model) {
+      language_model->load_state_dict(
+          state_dict.get_dict_with_prefix("language_model."));
+    }
+  }
+
   layer::LmHead get_lm_head() { return language_model_->get_lm_head(); }
   void set_lm_head(layer::LmHead& head) { language_model_->set_lm_head(head); }
 

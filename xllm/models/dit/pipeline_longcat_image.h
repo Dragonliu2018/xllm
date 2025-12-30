@@ -393,19 +393,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
           // Manually load weights for visual and language_model components
           // since DiTFolderLoader is not compatible with ModelLoader interface
-          auto state_dicts = text_encoder_loader->get_state_dicts();
-          for (const auto& state_dict : state_dicts) {
-            // Load visual component weights
-            auto visual = text_encoder_->get_visual();
-            visual->load_state_dict(
-                state_dict->get_dict_with_prefix("visual."));
-
-            // Load language model component weights
-            auto language_model = text_encoder_->get_language_model();
-            if (language_model) {
-              language_model->load_state_dict(
-                  state_dict->get_dict_with_prefix("language_model."));
-            }
+          auto& state_dicts = text_encoder_loader->get_state_dicts();
+          for (const auto& state_dict_ptr : state_dicts) {
+            // Load both visual and language_model components using
+            // load_state_dict
+            text_encoder_->load_state_dict(*state_dict_ptr);
+            LOG(INFO) << "Qwen2_5_VL components weights loaded";
           }
 
           text_encoder_->to(options_.device());
