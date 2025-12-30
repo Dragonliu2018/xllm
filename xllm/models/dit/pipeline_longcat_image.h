@@ -306,6 +306,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     const auto& model_args = context.get_model_args("vae");
     options_ = context.get_tensor_options();
     vae_scale_factor_ = 1 << (model_args.block_out_channels().size() - 1);
+    LOG(INFO) << "[LongCatImage] VAE block_out_channels size: "
+              << model_args.block_out_channels().size()
+              << ", calculated vae_scale_factor_: " << vae_scale_factor_;
 
     vae_shift_factor_ = model_args.shift_factor();
     vae_scaling_factor_ = model_args.scale_factor();
@@ -545,6 +548,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       std::optional<torch::Tensor> latents = std::nullopt) {
     int64_t adjusted_height = 2 * (height / (vae_scale_factor_ * 2));
     int64_t adjusted_width = 2 * (width / (vae_scale_factor_ * 2));
+    LOG(INFO) << "[LongCatImage] prepare_latents: height=" << height
+              << ", width=" << width
+              << ", vae_scale_factor_=" << vae_scale_factor_
+              << ", adjusted_height=" << adjusted_height
+              << ", adjusted_width=" << adjusted_width
+              << ", num_channels_latents=" << num_channels_latents;
     std::vector<int64_t> shape = {
         batch_size, num_channels_latents, adjusted_height, adjusted_width};
     if (latents.has_value()) {
@@ -728,6 +737,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     // prepare latent
     int64_t num_channels_latents = transformer_->in_channels() / 4;
+    LOG(INFO) << "[LongCatImage] transformer_->in_channels()="
+              << transformer_->in_channels()
+              << ", num_channels_latents=" << num_channels_latents
+              << ", vae_scale_factor_=" << vae_scale_factor_;
     auto [prepared_latents, latent_image_ids] =
         prepare_latents(total_batch_size,
                         num_channels_latents,
@@ -735,6 +748,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                         width,
                         seed.has_value() ? seed.value() : 42,
                         latents);
+    LOG(INFO) << "[LongCatImage] After prepare_latents: shape="
+              << prepared_latents.sizes()
+              << ", min/max=" << prepared_latents.min().item<float>() << "/"
+              << prepared_latents.max().item<float>();
 
     // prepare timestep
     std::vector<float> new_sigmas;
@@ -784,6 +801,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           .to(prepared_latents.dtype())
           .div_(1000.0f);
       int64_t step_id = i + 1;
+      if (i == 0) {
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << ": prepared_latents min/max before forward: "
+                  << prepared_latents.min().item<float>() << "/"
+                  << prepared_latents.max().item<float>();
+      }
       torch::Tensor noise_pred = transformer_->forward(prepared_latents,
                                                        encoded_prompt_embeds,
                                                        encoded_pooled_embeds,
@@ -791,6 +814,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                                        image_rotary_emb,
                                                        guidance,
                                                        step_id);
+      if (i == 0 || i == timesteps.numel() - 1) {
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << ": noise_pred min/max: " << noise_pred.min().item<float>()
+                  << "/" << noise_pred.max().item<float>();
+      }
       if (do_true_cfg) {
         torch::Tensor negative_noise_pred =
             transformer_->forward(prepared_latents,
@@ -805,6 +833,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         negative_noise_pred.reset();
       }
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
+      if (i == 0 || i == timesteps.numel() - 1) {
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << ": prev_latents (before detach) min/max: "
+                  << prev_latents.min().item<float>() << "/"
+                  << prev_latents.max().item<float>();
+      }
       prepared_latents = prev_latents.detach();
       std::vector<torch::Tensor> tensors = {prepared_latents, noise_pred};
       noise_pred.reset();
@@ -814,15 +848,39 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           prepared_latents.dtype() != latents.value().dtype()) {
         prepared_latents = prepared_latents.to(latents.value().dtype());
       }
+      if (i == timesteps.numel() - 1) {
+        LOG(INFO) << "[LongCatImage] Last step " << i
+                  << ": prepared_latents min/max after scheduler: "
+                  << prepared_latents.min().item<float>() << "/"
+                  << prepared_latents.max().item<float>();
+      }
     }
     torch::Tensor image;
     // Unpack latents
     torch::Tensor unpacked_latents =
         unpack_latents(prepared_latents, height, width, vae_scale_factor_);
+    LOG(INFO) << "[LongCatImage] After unpack_latents shape: "
+              << unpacked_latents.sizes();
+    LOG(INFO) << "[LongCatImage] After unpack_latents min/max: "
+              << unpacked_latents.min().item<float>() << "/"
+              << unpacked_latents.max().item<float>();
+    LOG(INFO) << "[LongCatImage] vae_scaling_factor_=" << vae_scaling_factor_
+              << ", vae_shift_factor_=" << vae_shift_factor_;
     unpacked_latents =
         (unpacked_latents / vae_scaling_factor_) + vae_shift_factor_;
+    LOG(INFO) << "[LongCatImage] After scaling/shifting shape: "
+              << unpacked_latents.sizes();
+    LOG(INFO) << "[LongCatImage] After scaling/shifting min/max: "
+              << unpacked_latents.min().item<float>() << "/"
+              << unpacked_latents.max().item<float>();
     unpacked_latents = unpacked_latents.to(options_.dtype());
+    LOG(INFO) << "[LongCatImage] After dtype conversion min/max: "
+              << unpacked_latents.min().item<float>() << "/"
+              << unpacked_latents.max().item<float>();
     image = vae_->decode(unpacked_latents);
+    LOG(INFO) << "[LongCatImage] After VAE decode shape: " << image.sizes();
+    LOG(INFO) << "[LongCatImage] After VAE decode min/max: "
+              << image.min().item<float>() << "/" << image.max().item<float>();
     image = vae_image_processor_->postprocess(image);
     LOG(INFO) << "[LongCatImage] Generated image tensor shape: "
               << image.sizes();
