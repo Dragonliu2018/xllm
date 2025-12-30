@@ -244,7 +244,7 @@ torch::Tensor prepare_latent_image_ids(int64_t batch_size,
 
 class LongCatImagePipelineImpl : public torch::nn::Module {
  public:
-  LongCatImagePipelineImpl(const DiTModelContext& context) {
+  LongCatImagePipelineImpl(const DiTModelContext& context) : context_(context) {
     const auto& model_args = context.get_model_args("vae");
     options_ = context.get_tensor_options();
     vae_scale_factor_ = 1 << (model_args.block_out_channels().size() - 1);
@@ -359,6 +359,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     LOG(INFO) << "LongCat-Image pipeline loading model from "
               << loader->model_root_path();
     std::string model_path = loader->model_root_path();
+
+    // Get all model args BEFORE taking any component loaders
+    // (because take_component_loader removes the loader from the map)
+    auto all_model_args = loader->get_model_args();
+    auto all_quant_args = loader->get_quant_args();
+
     auto transformer_loader = loader->take_component_loader("transformer");
     auto vae_loader = loader->take_component_loader("vae");
     auto text_encoder_loader = loader->take_component_loader("text_encoder");
@@ -377,16 +383,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     if (text_encoder_loader) {
       LOG(INFO) << "Loading Qwen2_5_VL text encoder model...";
       try {
-        auto all_model_args = loader->get_model_args();
-        auto all_quant_args = loader->get_quant_args();
-
         auto text_encoder_args_iter = all_model_args.find("text_encoder");
         auto text_encoder_quant_iter = all_quant_args.find("text_encoder");
 
         if (text_encoder_args_iter != all_model_args.end() &&
             text_encoder_quant_iter != all_quant_args.end()) {
+          // Use the parallel args from the DiTModelContext to avoid nullptr
           text_encoder_ = Qwen2_5_VLForConditionalGeneration(
-              ModelContext(ParallelArgs(1, 1, nullptr),
+              ModelContext(context_.get_parallel_args(),
                            text_encoder_args_iter->second,
                            text_encoder_quant_iter->second,
                            options_));
@@ -427,6 +431,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   }
 
  private:
+  // Model context (saved for use in load_model)
+  DiTModelContext context_;
+
   // Member variables
   torch::TensorOptions options_;
   int64_t vae_scale_factor_;
