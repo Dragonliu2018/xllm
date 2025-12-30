@@ -31,6 +31,8 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/platform/device.h"
+#include "core/util/numa_utils.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/parallel_state/collective_communicator.h"
@@ -69,7 +71,7 @@ void WorkerServer::create_server(
     WorkerType worker_type,
     std::unique_ptr<ForwardSharedMemoryManager> input_shm_manager,
     std::unique_ptr<ForwardSharedMemoryManager> output_shm_manager) {
-  Device device(d);
+  xllm::Device device(d);
   device.set_device();
   LOG(INFO) << "Create worker server with device: " << device.index();
 
