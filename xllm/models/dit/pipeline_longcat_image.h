@@ -17,19 +17,15 @@ limitations under the License.
 
 #include <torch/torch.h>
 
-// Include PyTorch distributed backend headers for mock ProcessGroup
 #include <algorithm>
 #include <memory>
 #include <string>
-#include <torch/csrc/distributed/c10d/Backend.hpp>
-#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
-#include <torch/csrc/distributed/c10d/Types.hpp>
-#include <torch/csrc/distributed/c10d/Work.hpp>
 
 #include "autoencoder_kl.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model_context.h"
 #include "core/framework/parallel_state/parallel_args.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/request/dit_request_state.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
@@ -47,59 +43,6 @@ namespace xllm {
 
 // Forward declarations
 class LongCatImagePipelineImpl;
-
-// Minimal Mock Backend for single-device VLM initialization
-// This is needed because Qwen2_5_VL's Qwen2VisionAttention expects tp_group_ to
-// be non-nullptr
-class MockBackendForVLM : public c10d::Backend {
- public:
-  MockBackendForVLM(int64_t rank, int64_t world_size)
-      : c10d::Backend(rank, world_size), rank_(rank), world_size_(world_size) {}
-
-  c10::intrusive_ptr<c10d::Work> allreduce(
-      std::vector<torch::Tensor>& tensors,
-      const c10d::AllreduceOptions& opts = c10d::AllreduceOptions()) override {
-    // Mock implementation - return a completed work for single-device
-    return c10::make_intrusive<c10d::Work>();
-  }
-
-  c10::intrusive_ptr<c10d::Work> allgather(
-      std::vector<std::vector<torch::Tensor>>& outputTensors,
-      std::vector<torch::Tensor>& inputTensors,
-      const c10d::AllgatherOptions& opts = c10d::AllgatherOptions()) override {
-    // Mock implementation - return a completed work for single-device
-    return c10::make_intrusive<c10d::Work>();
-  }
-
- private:
-  int64_t rank_;
-  int64_t world_size_;
-};
-
-// Minimal Mock ProcessGroup for single-device VLM initialization
-class MockProcessGroupForVLM : public ProcessGroup {
- public:
-  MockProcessGroupForVLM(const torch::Device& device) : ProcessGroup(device) {
-    // Initialize pg_ with our mock backend for single-device (rank=0,
-    // world_size=1)
-    pg_ = std::make_unique<MockBackendForVLM>(0, 1);
-  }
-
-  // Override allreduce to do nothing for single-device
-  void allreduce(torch::Tensor& input) override {
-    // Mock implementation - do nothing for single-device
-  }
-
-  // Override allgather to just copy input for single-device
-  void allgather(const torch::Tensor& input,
-                 std::vector<torch::Tensor>& outputs) override {
-    // Mock implementation - just copy input to outputs for single-device
-    outputs.resize(this->world_size());
-    for (size_t i = 0; i < this->world_size(); ++i) {
-      outputs[i] = input.clone();
-    }
-  }
-};
 
 // Utility functions (copied from pipeline_flux_base.h)
 constexpr int64_t ROPE_SCALE_BASE = 10000;
@@ -463,19 +406,26 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             text_encoder_quant_iter != all_quant_args.end()) {
           // Check if tp_group_ is nullptr (single-device mode)
           // Qwen2_5_VL's Qwen2VisionAttention expects tp_group_ to be
-          // non-nullptr If it's nullptr, we need to create a mock ProcessGroup
+          // non-nullptr If it's nullptr, we need to create a real ProcessGroup
           // for single-device inference
           const auto& original_parallel_args = context_.get_parallel_args();
           ParallelArgs vlm_parallel_args =
               original_parallel_args;  // Copy original args
 
-          std::unique_ptr<MockProcessGroupForVLM> mock_tp_group;
           if (original_parallel_args.tp_group_ == nullptr) {
-            LOG(INFO) << "Creating MockProcessGroupForVLM for single-device "
+            LOG(INFO) << "Creating real ProcessGroup for single-device "
                          "VLM initialization.";
-            mock_tp_group =
-                std::make_unique<MockProcessGroupForVLM>(options_.device());
-            vlm_parallel_args.tp_group_ = mock_tp_group.get();
+            // Create a real single-device ProcessGroup (rank=0, world_size=1)
+            vlm_tp_group_ =
+                create_process_group(0,               // rank
+                                     1,               // world_size
+                                     1,               // rank_size
+                                     29500,           // port (arbitrary)
+                                     false,           // trans
+                                     "127.0.0.1",     // host (localhost)
+                                     "vlm_tp_group",  // group_name
+                                     options_.device());
+            vlm_parallel_args.tp_group_ = vlm_tp_group_.get();
           }
 
           text_encoder_ = Qwen2_5_VLForConditionalGeneration(
@@ -529,6 +479,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   float vae_shift_factor_;
   float vae_scaling_factor_;
   int64_t tokenizer_max_length_;
+
+  // ProcessGroup for VLM (single-device)
+  std::unique_ptr<ProcessGroup> vlm_tp_group_;
 
   // Model components
   VAEImageProcessor vae_image_processor_{nullptr};
