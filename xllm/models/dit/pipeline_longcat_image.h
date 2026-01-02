@@ -598,6 +598,18 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
           if (tokenizer_ &&
               tokenizer_->batch_encode(repeated_prompts, &text_input_ids)) {
+            LOG(INFO) << "[DEBUG] batch_encode result: true";
+            for (size_t i = 0; i < text_input_ids.size(); ++i) {
+              std::string ids_str;
+              if (!text_input_ids[i].empty()) {
+                ids_str =
+                    "size=" + std::to_string(text_input_ids[i].size()) +
+                    ", first_token=" + std::to_string(text_input_ids[i][0]);
+              } else {
+                ids_str = "empty";
+              }
+              LOG(INFO) << "[DEBUG] text_input_ids[" << i << "]: " << ids_str;
+            }
             // Truncate or pad to max_sequence_length
             for (auto& ids : text_input_ids) {
               if (ids.size() > max_sequence_length) {
@@ -760,6 +772,20 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                   << prepared_latents.min().item<float>() << "/"
                   << prepared_latents.max().item<float>();
       }
+      LOG(INFO) << "[DEBUG] transformer->forward() 输入: latent min/max: "
+                << prepared_latents.min().item<float>() << "/"
+                << prepared_latents.max().item<float>()
+                << ", prompt_embeds min/max: "
+                << encoded_prompt_embeds.min().item<float>() << "/"
+                << encoded_prompt_embeds.max().item<float>()
+                << ", pooled_embeds min/max: "
+                << encoded_pooled_embeds.min().item<float>() << "/"
+                << encoded_pooled_embeds.max().item<float>()
+                << ", timestep min/max: " << timestep.min().item<float>() << "/"
+                << timestep.max().item<float>()
+                << ", image_rotary_emb min/max: "
+                << image_rotary_emb.min().item<float>() << "/"
+                << image_rotary_emb.max().item<float>();
       torch::Tensor noise_pred = transformer_->forward(prepared_latents,
                                                        encoded_prompt_embeds,
                                                        encoded_pooled_embeds,
@@ -767,6 +793,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                                        image_rotary_emb,
                                                        guidance,
                                                        step_id);
+      LOG(INFO) << "[DEBUG] transformer->forward() 输出: noise_pred min/max: "
+                << noise_pred.min().item<float>() << "/"
+                << noise_pred.max().item<float>();
       if (i == 0 || i == timesteps.numel() - 1) {
         LOG(INFO) << "[LongCatImage] Step " << i
                   << ": noise_pred min/max: " << noise_pred.min().item<float>()
