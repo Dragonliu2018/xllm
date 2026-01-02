@@ -565,7 +565,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     } else {
       batch_size = prompt_embeds.value().size(0);
     }
-    int64_t total_batch_size = batch_size * num_images_per_prompt;
+    int64_t total_batch_size = batch_size * num_images_per_prompt;  // 1=1*1
     LOG(INFO) << "[dragon]: batch_size(" << batch_size << "), total_batch_size("
               << total_batch_size << ")";
     bool has_neg_prompt = negative_prompt.has_value() ||
@@ -633,6 +633,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                 torch::tensor(input_ids_flat, torch::dtype(torch::kLong))
                     .view({total_batch_size, max_sequence_length})
                     .to(options_.device());
+            // 打印 input_ids 内容和统计信息
+            LOG(INFO) << "[LongCatImage] input_ids shape: "
+                      << input_ids.sizes();
+            LOG(INFO) << "[LongCatImage] input_ids min: "
+                      << input_ids.min().item<int64_t>()
+                      << ", max: " << input_ids.max().item<int64_t>();
+            LOG(INFO) << "[LongCatImage] input_ids[0][0:8]: "
+                      << input_ids[0].slice(0, 0, 8);
 
             // Encode using VLM text encoder
             torch::NoGradGuard no_grad;
@@ -650,6 +658,25 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                       << encoded_prompt_embeds.sizes();  // [1, 512, 3584]
             LOG(INFO) << "[LongCatImage] Encoded pooled_embeds shape: "
                       << encoded_pooled_embeds.sizes();  // [1, 3584]
+            // 打印 embedding 内容和统计信息
+            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds shape: "
+                      << encoded_prompt_embeds.sizes();
+            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds min: "
+                      << encoded_prompt_embeds.min().item<float>()
+                      << ", max: " << encoded_prompt_embeds.max().item<float>()
+                      << ", mean: "
+                      << encoded_prompt_embeds.mean().item<float>();
+            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds shape: "
+                      << encoded_pooled_embeds.sizes();
+            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds min: "
+                      << encoded_pooled_embeds.min().item<float>()
+                      << ", max: " << encoded_pooled_embeds.max().item<float>()
+                      << ", mean: "
+                      << encoded_pooled_embeds.mean().item<float>();
+            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds[0][0][0:8]: "
+                      << encoded_prompt_embeds[0][0].slice(0, 0, 8);
+            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds[0][0:8]: "
+                      << encoded_pooled_embeds[0].slice(0, 0, 8);
           } else {
             throw std::runtime_error("Failed to tokenize prompts");
           }

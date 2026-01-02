@@ -646,9 +646,20 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       const std::optional<Qwen2_5_VLImageInputs>& image_input,
       const std::optional<Qwen2_5_VLVideoInputs>& video_input,
       const ModelInputParams& input_params) {
+    LOG(INFO) << "[dragon-qwen2_5_vl]";
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
+    LOG(INFO) << "[qwen2_5_vl] inputs_embeds shape: "
+              << inputs_embeds.sizes();  // [qwen2_5_vl] inputs_embeds shape:
+                                         // [1, 512, 3584]
+    LOG(INFO)
+        << "[qwen2_5_vl] inputs_embeds min: "
+        << inputs_embeds.min().item<float>()
+        << ", max: " << inputs_embeds.max().item<float>() << ", mean: "
+        << inputs_embeds.mean().item<float>();  // [qwen2_5_vl] inputs_embeds
+                                                // min: 0, max: 0, mean: 0
     if (image_input) {
       // visual
+      LOG(INFO) << "[dragon-qwen2_5_vl-image]";
       auto image_embeds = visual_(image_input->pixel_values.to(options_),
                                   image_input->image_grid_thw,
                                   input_params);
@@ -658,6 +669,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     }
     if (video_input) {
       // visual
+      LOG(INFO) << "[dragon-qwen2_5_vl-video]";
       auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
                                   video_input->video_grid_thw,
                                   input_params);
