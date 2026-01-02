@@ -284,9 +284,32 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                      context.get_quant_args("transformer"),
                      context.get_tensor_options()));
 
+    // 判断是否需要创建单卡 ProcessGroup，并挂载到 ParallelArgs
+    const auto& original_parallel_args = context.get_parallel_args();
+    ParallelArgs vlm_parallel_args = original_parallel_args;  // 拷贝
+    if (original_parallel_args.tp_group_ == nullptr) {
+      LOG(INFO)
+          << "Creating real ProcessGroup for single-device VLM initialization.";
+      vlm_tp_group_ = create_process_group(0,
+                                           1,
+                                           1,
+                                           29500,
+                                           false,
+                                           "127.0.0.1",
+                                           "vlm_tp_group",
+                                           options_.device());
+      vlm_parallel_args.tp_group_ = vlm_tp_group_.get();
+    }
+
     // LongCat-Image uses Qwen2_5_VL as text encoder, not CLIP+T5
-    // VLM integration is complete and weights will be loaded in load_model()
     LOG(INFO) << "LongCat-Image uses Qwen2_5_VL as text encoder";
+    // 初始化 text_encoder_（只构造对象，不加载权重），传入新的
+    // vlm_parallel_args
+    text_encoder_ = Qwen2_5_VLForConditionalGeneration(
+        ModelContext(vlm_parallel_args,
+                     context.get_model_args("text_encoder"),
+                     context.get_quant_args("text_encoder"),
+                     context.get_tensor_options()));
 
     scheduler_ = FlowMatchEulerDiscreteScheduler(
         ModelContext(context.get_parallel_args(),
@@ -296,6 +319,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     register_module("vae", vae_);
     register_module("vae_image_processor", vae_image_processor_);
     register_module("transformer", transformer_);
+    register_module("text_encoder", text_encoder_);
     register_module("scheduler", scheduler_);
   }
 
@@ -397,60 +421,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     // Load VLM text encoder model (Qwen2_5_VL)
     if (text_encoder_loader) {
-      LOG(INFO) << "Loading Qwen2_5_VL text encoder model...";
+      LOG(INFO) << "Loading Qwen2_5_VL text encoder weights...";
       try {
-        auto text_encoder_args_iter = all_model_args.find("text_encoder");
-        auto text_encoder_quant_iter = all_quant_args.find("text_encoder");
-
-        if (text_encoder_args_iter != all_model_args.end() &&
-            text_encoder_quant_iter != all_quant_args.end()) {
-          // Check if tp_group_ is nullptr (single-device mode)
-          // Qwen2_5_VL's Qwen2VisionAttention expects tp_group_ to be
-          // non-nullptr If it's nullptr, we need to create a real ProcessGroup
-          // for single-device inference
-          const auto& original_parallel_args = context_.get_parallel_args();
-          ParallelArgs vlm_parallel_args =
-              original_parallel_args;  // Copy original args
-
-          if (original_parallel_args.tp_group_ == nullptr) {
-            LOG(INFO) << "Creating real ProcessGroup for single-device "
-                         "VLM initialization.";
-            // Create a real single-device ProcessGroup (rank=0, world_size=1)
-            vlm_tp_group_ =
-                create_process_group(0,               // rank
-                                     1,               // world_size
-                                     1,               // rank_size
-                                     29500,           // port (arbitrary)
-                                     false,           // trans
-                                     "127.0.0.1",     // host (localhost)
-                                     "vlm_tp_group",  // group_name
-                                     options_.device());
-            vlm_parallel_args.tp_group_ = vlm_tp_group_.get();
-          }
-
-          text_encoder_ = Qwen2_5_VLForConditionalGeneration(
-              ModelContext(vlm_parallel_args,
-                           text_encoder_args_iter->second,
-                           text_encoder_quant_iter->second,
-                           options_));
-
-          // Manually load weights for visual and language_model components
-          // since DiTFolderLoader is not compatible with ModelLoader interface
-          auto& state_dicts = text_encoder_loader->get_state_dicts();
-          for (const auto& state_dict_ptr : state_dicts) {
-            // Load both visual and language_model components using
-            // load_state_dict
-            text_encoder_->load_state_dict(*state_dict_ptr);
-            LOG(INFO) << "Qwen2_5_VL components weights loaded";
-          }
-
-          text_encoder_->to(options_.device());
-          LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
-        } else {
-          LOG(WARNING)
-              << "Text encoder model args not found, will use dummy embeddings";
-          text_encoder_ = nullptr;
+        // 只加载权重，不再重新构造对象
+        auto& state_dicts = text_encoder_loader->get_state_dicts();
+        for (const auto& state_dict_ptr : state_dicts) {
+          text_encoder_->load_state_dict(*state_dict_ptr);
+          LOG(INFO) << "Qwen2_5_VL components weights loaded";
         }
+        text_encoder_->to(options_.device());
+        LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
       } catch (const std::exception& e) {
         LOG(WARNING) << "Failed to load Qwen2_5_VL text encoder: " << e.what()
                      << ", will use dummy embeddings as fallback";
