@@ -258,17 +258,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     tokenizer_max_length_ =
         context.get_model_args("text_encoder").max_position_embeddings();
     LOG(INFO) << "Initializing LongCat-Image pipeline...";
-    vae_image_processor_ =
-        VAEImageProcessor(ModelContext(context.get_parallel_args(),
-                                       context.get_model_args("vae"),
-                                       context.get_quant_args("vae"),
-                                       context.get_tensor_options()),
-                          true,
-                          true,
-                          false,
-                          false,
-                          false,
-                          model_args.latent_channels());
+    vae_image_processor_ = VAEImageProcessor(
+        ModelContext(context.get_parallel_args(),
+                     context.get_model_args("vae"),
+                     context.get_quant_args("vae"),
+                     context.get_tensor_options()),
+        true,  // do_resize
+        true,  // do_normalize (denormalize VAE output from [-1, 1] to [0, 1])
+        false,
+        false,
+        false,
+        model_args.latent_channels());
     vae_ = VAE(ModelContext(context.get_parallel_args(),
                             context.get_model_args("vae"),
                             context.get_quant_args("vae"),
@@ -414,10 +414,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     LOG(INFO) << "LongCat-Image model components loaded, start to load weights "
                  "to sub models";
+
+    // Load Transformer
     transformer_->load_model(std::move(transformer_loader));
     transformer_->to(options_.device());
+    transformer_->eval();  // Set transformer to evaluation mode
+
+    // Load VAE
     vae_->load_model(std::move(vae_loader));
     vae_->to(options_.device());
+    vae_->eval();  // Set VAE to evaluation mode
 
     // Load VLM text encoder model (Qwen2_5_VL)
     if (text_encoder_loader) {
@@ -432,6 +438,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         text_encoder_->load_model(std::move(model_loader));
         LOG(INFO) << "After load_model: weights should be loaded";
         text_encoder_->to(options_.device());
+        text_encoder_->eval();  // Set text encoder to evaluation mode
         LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
 
         // 验证权重是否被加载
@@ -884,7 +891,13 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     LOG(INFO) << "[LongCatImage] After VAE decode shape: " << image.sizes();
     LOG(INFO) << "[LongCatImage] After VAE decode min/max: "
               << image.min().item<float>() << "/" << image.max().item<float>();
+
+    // postprocess will denormalize VAE output from [-1, 1] to [0, 1]
     image = vae_image_processor_->postprocess(image);
+    LOG(INFO) << "[LongCatImage] After postprocess shape: " << image.sizes();
+    LOG(INFO) << "[LongCatImage] After postprocess min/max: "
+              << image.min().item<float>() << "/" << image.max().item<float>();
+
     LOG(INFO) << "[LongCatImage] Generated image tensor shape: "
               << image.sizes();
     LOG(INFO) << "[LongCatImage] Image tensor min/max: "
