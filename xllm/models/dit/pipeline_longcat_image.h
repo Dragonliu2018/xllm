@@ -423,14 +423,28 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     if (text_encoder_loader) {
       LOG(INFO) << "Loading Qwen2_5_VL text encoder weights...";
       try {
-        // 只加载权重，不再重新构造对象
-        auto& state_dicts = text_encoder_loader->get_state_dicts();
-        for (const auto& state_dict_ptr : state_dicts) {
-          text_encoder_->load_state_dict(*state_dict_ptr);
-          LOG(INFO) << "Qwen2_5_VL components weights loaded";
-        }
+        // 使用 load_model 方法加载权重
+        // 这会自动处理 visual 和 language_model 的权重加载
+        // DiTFolderLoader 继承自 ModelLoader，可以直接转换
+        LOG(INFO) << "Before load_model: text_encoder_ is initialized";
+        std::unique_ptr<ModelLoader> model_loader(
+            std::move(text_encoder_loader));
+        text_encoder_->load_model(std::move(model_loader));
+        LOG(INFO) << "After load_model: weights should be loaded";
         text_encoder_->to(options_.device());
         LOG(INFO) << "Qwen2_5_VL text encoder loaded successfully";
+
+        // 验证权重是否被加载
+        auto word_embedding =
+            text_encoder_->get_language_model()->get_word_embedding();
+        if (word_embedding) {
+          auto weight = word_embedding->weight();
+          LOG(INFO) << "[DEBUG] Word embedding weight shape: "
+                    << weight.sizes();
+          LOG(INFO) << "[DEBUG] Word embedding weight min/max: "
+                    << weight.min().item<float>() << "/"
+                    << weight.max().item<float>();
+        }
       } catch (const std::exception& e) {
         LOG(WARNING) << "Failed to load Qwen2_5_VL text encoder: " << e.what()
                      << ", will use dummy embeddings as fallback";

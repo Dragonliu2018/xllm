@@ -751,7 +751,7 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     auto language_model = language_model_;
     if (language_model) {
       language_model->load_state_dict(
-          state_dict.get_dict_with_prefix("language_model."));
+          state_dict.get_dict_with_prefix("language_model."));  // bug?
     }
   }
 
