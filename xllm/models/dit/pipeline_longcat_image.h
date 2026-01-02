@@ -566,6 +566,8 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       batch_size = prompt_embeds.value().size(0);
     }
     int64_t total_batch_size = batch_size * num_images_per_prompt;
+    LOG(INFO) << "[dragon]: batch_size(" << batch_size << "), total_batch_size("
+              << total_batch_size << ")";
     bool has_neg_prompt = negative_prompt.has_value() ||
                           (negative_prompt_embeds.has_value() &&
                            negative_pooled_prompt_embeds.has_value());
@@ -643,13 +645,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             // Use mean pooling as pooled embeddings
             encoded_pooled_embeds = input_embeds.mean(1);
 
-            LOG(INFO) << "VLM text encoding successful, output shapes: "
-                      << encoded_prompt_embeds.sizes() << ", "
-                      << encoded_pooled_embeds.sizes();
+            LOG(INFO) << "VLM text encoding successful";
             LOG(INFO) << "[LongCatImage] Encoded prompt_embeds shape: "
-                      << encoded_prompt_embeds.sizes();
+                      << encoded_prompt_embeds.sizes();  // [1, 512, 3584]
             LOG(INFO) << "[LongCatImage] Encoded pooled_embeds shape: "
-                      << encoded_pooled_embeds.sizes();
+                      << encoded_pooled_embeds.sizes();  // [1, 3584]
           } else {
             throw std::runtime_error("Failed to tokenize prompts");
           }
