@@ -415,15 +415,37 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     LOG(INFO) << "LongCat-Image model components loaded, start to load weights "
                  "to sub models";
 
-    // Load Transformer
+    // Load and verify Transformer
+    LOG(INFO) << "[WEIGHT_CHECK] Starting Transformer weight loading...";
+    LOG(INFO) << "[WEIGHT_CHECK] Transformer config: "
+              << "num_layers="
+              << context_.get_model_args("transformer").num_layers()
+              << ", num_single_layers="
+              << context_.get_model_args("transformer").num_single_layers()
+              << ", joint_attention_dim="
+              << context_.get_model_args("transformer").joint_attention_dim()
+              << ", pooled_projection_dim="
+              << context_.get_model_args("transformer").pooled_projection_dim()
+              << ", guidance_embeds="
+              << context_.get_model_args("transformer").guidance_embeds();
     transformer_->load_model(std::move(transformer_loader));
     transformer_->to(options_.device());
     transformer_->eval();  // Set transformer to evaluation mode
+    LOG(INFO) << "[WEIGHT_CHECK] Transformer weight loading completed.";
 
-    // Load VAE
+    // Load and verify VAE
+    LOG(INFO) << "[WEIGHT_CHECK] Starting VAE weight loading...";
+    LOG(INFO) << "[WEIGHT_CHECK] VAE config: "
+              << "latent_channels="
+              << context_.get_model_args("vae").latent_channels()
+              << ", scaling_factor="
+              << context_.get_model_args("vae").scale_factor()
+              << ", shift_factor="
+              << context_.get_model_args("vae").shift_factor();
     vae_->load_model(std::move(vae_loader));
     vae_->to(options_.device());
     vae_->eval();  // Set VAE to evaluation mode
+    LOG(INFO) << "[WEIGHT_CHECK] VAE weight loading completed.";
 
     // Load VLM text encoder model (Qwen2_5_VL)
     if (text_encoder_loader) {
