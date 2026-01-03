@@ -1804,7 +1804,7 @@ const bool longcat_image_transformer_args_registered = []() {
         // Qwen2_5_VL hidden_size)
         LOAD_ARG_OR(joint_attention_dim, "joint_attention_dim", 3584);
         LOAD_ARG_OR(pooled_projection_dim, "pooled_projection_dim", 3584);
-        LOAD_ARG_OR(guidance_embeds, "guidance_embeds", false);
+        LOAD_ARG_OR(guidance_embeds, "guidance_embeds", true);
         LOAD_ARG_OR(axes_dims_rope,
                     "axes_dims_rope",
                     (std::vector<int64_t>{16, 56, 56}));

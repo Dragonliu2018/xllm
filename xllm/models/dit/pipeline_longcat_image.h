@@ -836,6 +836,22 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                 << ", image_rotary_emb min/max: "
                 << image_rotary_emb.min().item<float>() << "/"
                 << image_rotary_emb.max().item<float>();
+      // Check for NaN in inputs
+      if (torch::isnan(prepared_latents).any().item<bool>()) {
+        LOG(ERROR) << "NaN detected in prepared_latents!";
+      }
+      if (torch::isnan(encoded_prompt_embeds).any().item<bool>()) {
+        LOG(ERROR) << "NaN detected in encoded_prompt_embeds!";
+      }
+      if (torch::isnan(encoded_pooled_embeds).any().item<bool>()) {
+        LOG(ERROR) << "NaN detected in encoded_pooled_embeds!";
+      }
+      if (torch::isnan(timestep).any().item<bool>()) {
+        LOG(ERROR) << "NaN detected in timestep!";
+      }
+      if (torch::isnan(image_rotary_emb).any().item<bool>()) {
+        LOG(ERROR) << "NaN detected in image_rotary_emb!";
+      }
       torch::Tensor noise_pred = transformer_->forward(prepared_latents,
                                                        encoded_prompt_embeds,
                                                        encoded_pooled_embeds,
