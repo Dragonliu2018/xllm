@@ -848,9 +848,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i].unsqueeze(0);
-      timestep.fill_(t.item<float>())
-          .to(prepared_latents.dtype())
-          .div_(1000.0f);
+      // timesteps from scheduler are in [0, 1000] range
+      // Pass directly to transformer (no normalization here)
+      // The transformer will handle: timestep.to(hidden_states.dtype) * 1000
+      // which will scale [0, 1000] to [0, 1000000] for the embedding
+      timestep.fill_(t.item<float>()).to(prepared_latents.dtype());
       int64_t step_id = i + 1;
       if (i == 0) {
         LOG(INFO) << "[LongCatImage] Step " << i

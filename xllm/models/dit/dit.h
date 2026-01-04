@@ -669,7 +669,9 @@ class TimestepEmbeddingImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& sample,
                         const torch::Tensor& condition = torch::Tensor()) {
-    torch::Tensor x1 = linear_1_->forward(sample);
+    // Ensure sample is in the correct dtype for the linear layer
+    torch::Tensor sample_converted = sample.to(options_.dtype());
+    torch::Tensor x1 = linear_1_->forward(sample_converted);
     x1 = act_fn_->forward(x1);
     x1 = linear_2_->forward(x1);
     return x1;
@@ -708,9 +710,15 @@ class LongCatImageTimestepEmbeddingsImpl : public torch::nn::Module {
     timestep_embedder_ = TimestepEmbedding(context);
   }
 
-  torch::Tensor forward(const torch::Tensor& timestep) {
+  torch::Tensor forward(const torch::Tensor& timestep,
+                        torch::Dtype hidden_dtype = torch::kBFloat16) {
     auto timesteps_proj = time_proj_(timestep);
-    auto timesteps_emb = timestep_embedder_(timesteps_proj);
+    // Match Python: timesteps_emb =
+    // self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype)) Compute in
+    // Float32 for numerical stability, then convert to target dtype
+    auto timesteps_proj_f32 = timesteps_proj.to(torch::kFloat32);
+    auto timesteps_emb_f32 = timestep_embedder_(timesteps_proj_f32);
+    auto timesteps_emb = timesteps_emb_f32.to(hidden_dtype);
     return timesteps_emb;
   }
 
@@ -1342,7 +1350,10 @@ class FluxTransformer2DModelImpl : public torch::nn::Module {
     auto timestep_scaled = timestep.to(hidden_states.dtype()) * 1000.0f;
 
     // Get timestep embedding (LongCat-Image only has timestep, not text)
-    auto temb = time_embed_->forward(timestep_scaled);
+    // Pass hidden_states.scalar_type() to ensure timestep embedding is in
+    // correct dtype
+    auto temb =
+        time_embed_->forward(timestep_scaled, hidden_states.scalar_type());
     torch::Tensor encoder_hidden_states =
         context_embedder_->forward(encoder_hidden_states_input);
 
@@ -1629,7 +1640,10 @@ class LongCatImageTransformer2DModelImpl : public torch::nn::Module {
     auto timestep_scaled = timestep.to(hidden_states.dtype()) * 1000.0f;
 
     // Get timestep embedding (LongCat-Image only has timestep, not text)
-    auto temb = time_embed_->forward(timestep_scaled);
+    // Pass hidden_states.scalar_type() to ensure timestep embedding is in
+    // correct dtype
+    auto temb =
+        time_embed_->forward(timestep_scaled, hidden_states.scalar_type());
 
     torch::Tensor encoder_hidden_states =
         context_embedder_->forward(encoder_hidden_states_input);
