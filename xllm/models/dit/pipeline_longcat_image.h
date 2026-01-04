@@ -230,15 +230,27 @@ torch::Tensor unpack_latents(torch::Tensor latents,
   return latents_unpacked;
 }
 
-torch::Tensor prepare_latent_image_ids(int64_t batch_size,
-                                       int64_t height,
+// Prompt templates for LongCat-Image (matching Python implementation)
+constexpr const char* PROMPT_TEMPLATE_ENCODE_PREFIX =
+    "<|im_start|>system\\nAs an image captioning expert, generate a "
+    "descriptive text prompt based on an image content, suitable for input to "
+    "a text-to-image model.<|im_end|>\\n<|im_start|>user\\n";
+constexpr const char* PROMPT_TEMPLATE_ENCODE_SUFFIX =
+    "<|im_end|>\\n<|im_start|>assistant\\n";
+
+torch::Tensor prepare_latent_image_ids(int64_t height,
                                        int64_t width,
+                                       int64_t start_h,
+                                       int64_t start_w,
                                        const torch::TensorOptions& options) {
   torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options);
+  // Set modality_id for image (1)
+  latent_image_ids.select(2, 0).fill_(1);
+  // Set position indices with start offset
   torch::Tensor height_range = torch::arange(height, options).unsqueeze(1);
-  latent_image_ids.select(2, 1) += height_range;
+  latent_image_ids.select(2, 1) += height_range + start_h;
   torch::Tensor width_range = torch::arange(width, options).unsqueeze(0);
-  latent_image_ids.select(2, 2) += width_range;
+  latent_image_ids.select(2, 2) += width_range + start_w;
   latent_image_ids = latent_image_ids.view({height * width, 3});
   return latent_image_ids;
 }
@@ -431,6 +443,8 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     transformer_->load_model(std::move(transformer_loader));
     transformer_->to(options_.device());
     transformer_->eval();  // Set transformer to evaluation mode
+    // Verify loaded weights including NaN checks
+    transformer_->verify_loaded_weights("transformer.");
     LOG(INFO) << "[WEIGHT_CHECK] Transformer weight loading completed.";
 
     // Load and verify VAE
@@ -533,8 +547,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     std::vector<int64_t> shape = {
         batch_size, num_channels_latents, adjusted_height, adjusted_width};
     if (latents.has_value()) {
-      torch::Tensor latent_image_ids = prepare_latent_image_ids(
-          batch_size, adjusted_height / 2, adjusted_width / 2, options_);
+      torch::Tensor latent_image_ids =
+          prepare_latent_image_ids(adjusted_height / 2,
+                                   adjusted_width / 2,
+                                   tokenizer_max_length_,
+                                   tokenizer_max_length_,
+                                   options_);
       return {latents.value(), latent_image_ids};
     }
     torch::Tensor latents_tensor = randn_tensor(shape, seed, options_);
@@ -543,8 +561,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                                 num_channels_latents,
                                                 adjusted_height,
                                                 adjusted_width);
-    torch::Tensor latent_image_ids = prepare_latent_image_ids(
-        batch_size, adjusted_height / 2, adjusted_width / 2, options_);
+    torch::Tensor latent_image_ids =
+        prepare_latent_image_ids(adjusted_height / 2,
+                                 adjusted_width / 2,
+                                 tokenizer_max_length_,
+                                 tokenizer_max_length_,
+                                 options_);
     return {packed_latents, latent_image_ids};
   }
 
@@ -724,9 +746,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       }
     }
 
+    // Prepare text_ids with modality_id (0) and position information
     text_ids =
         torch::zeros({max_sequence_length, 3},
                      torch::dtype(torch::kLong).device(options_.device()));
+    text_ids.select(1, 0).fill_(0);  // modality_id = 0 for text
+    torch::Tensor pos_range =
+        torch::arange(max_sequence_length,
+                      torch::dtype(torch::kLong).device(options_.device()));
+    text_ids.select(1, 1) += pos_range;  // position index
+    text_ids.select(1, 2) += pos_range;  // position index
 
     // encode negative prompt
     torch::Tensor negative_encoded_embeds, negative_pooled_embeds;
@@ -745,9 +774,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             at::IntArrayRef({total_batch_size, pooled_projection_dim}),
             options_);
       }
+      // Prepare negative_text_ids with modality_id (0) and position information
       negative_text_ids =
           torch::zeros({max_sequence_length, 3},
                        torch::dtype(torch::kLong).device(options_.device()));
+      negative_text_ids.select(1, 0).fill_(0);  // modality_id = 0 for text
+      torch::Tensor neg_pos_range =
+          torch::arange(max_sequence_length,
+                        torch::dtype(torch::kLong).device(options_.device()));
+      negative_text_ids.select(1, 1) += neg_pos_range;  // position index
+      negative_text_ids.select(1, 2) += neg_pos_range;  // position index
     }
 
     // prepare latent
@@ -852,23 +888,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       if (torch::isnan(image_rotary_emb).any().item<bool>()) {
         LOG(ERROR) << "NaN detected in image_rotary_emb!";
       }
-      torch::Tensor noise_pred = transformer_->forward(prepared_latents,
-                                                       encoded_prompt_embeds,
-                                                       encoded_pooled_embeds,
-                                                       timestep,
-                                                       image_rotary_emb,
-                                                       guidance,
-                                                       step_id);
-      LOG(INFO) << "[DEBUG] transformer->forward() 输出: noise_pred min/max: "
-                << noise_pred.min().item<float>() << "/"
-                << noise_pred.max().item<float>();
-      if (i == 0 || i == timesteps.numel() - 1) {
-        LOG(INFO) << "[LongCatImage] Step " << i
-                  << ": noise_pred min/max: " << noise_pred.min().item<float>()
-                  << "/" << noise_pred.max().item<float>();
-      }
+      // Forward pass with text prompt
+      torch::Tensor noise_pred_text =
+          transformer_->forward(prepared_latents,
+                                encoded_prompt_embeds,
+                                encoded_pooled_embeds,
+                                timestep,
+                                image_rotary_emb,
+                                guidance,
+                                step_id);
+      LOG(INFO)
+          << "[DEBUG] transformer->forward() 输出: noise_pred_text min/max: "
+          << noise_pred_text.min().item<float>() << "/"
+          << noise_pred_text.max().item<float>();
+
+      torch::Tensor noise_pred;
       if (do_true_cfg) {
-        torch::Tensor negative_noise_pred =
+        // Forward pass with negative prompt
+        torch::Tensor noise_pred_uncond =
             transformer_->forward(prepared_latents,
                                   negative_encoded_embeds,
                                   negative_pooled_embeds,
@@ -876,9 +913,30 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                   image_rotary_emb,
                                   guidance,
                                   step_id);
-        noise_pred =
-            noise_pred + (noise_pred - negative_noise_pred) * true_cfg_scale;
-        negative_noise_pred.reset();
+        // Classifier Free Guidance:
+        // noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text -
+        // noise_pred_uncond)
+        noise_pred = noise_pred_uncond +
+                     guidance_scale * (noise_pred_text - noise_pred_uncond);
+
+        // Optional: cfg_renorm for improved stability
+        // if enable_cfg_renorm:
+        //     cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
+        //     noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        //     scale = (cond_norm / (noise_norm +
+        //     1e-8)).clamp(min=cfg_renorm_min, max=1.0) noise_pred = noise_pred
+        //     * scale
+
+        noise_pred_uncond.reset();
+      } else {
+        noise_pred = noise_pred_text;
+      }
+      noise_pred_text.reset();
+
+      if (i == 0 || i == timesteps.numel() - 1) {
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << ": noise_pred min/max: " << noise_pred.min().item<float>()
+                  << "/" << noise_pred.max().item<float>();
       }
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
       if (i == 0 || i == timesteps.numel() - 1) {
