@@ -385,8 +385,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         prompt_embeds,                            // prompt_embeds
         negative_prompt_embeds,                   // negative_prompt_embeds
         pooled_prompt_embeds,                     // pooled_prompt_embeds
-        negative_pooled_prompt_embeds,         // negative_pooled_prompt_embeds
-        generation_params.max_sequence_length  // max_sequence_length
+        negative_pooled_prompt_embeds,          // negative_pooled_prompt_embeds
+        generation_params.max_sequence_length,  // max_sequence_length
+        generation_params.enable_cfg_renorm,    // enable_cfg_renorm
+        generation_params.cfg_renorm_min        // cfg_renorm_min
     );
 
     DiTForwardOutput out;
@@ -587,7 +589,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       std::optional<torch::Tensor> pooled_prompt_embeds = std::nullopt,
       std::optional<torch::Tensor> negative_prompt_embeds = std::nullopt,
       std::optional<torch::Tensor> negative_pooled_prompt_embeds = std::nullopt,
-      int64_t max_sequence_length = 512) {
+      int64_t max_sequence_length = 512,
+      bool enable_cfg_renorm = true,
+      float cfg_renorm_min = 0.0f,
+      bool enable_prompt_rewrite = false) {
     torch::NoGradGuard no_grad;
     // 打印推理参数
     LOG(INFO) << "[LongCatImage] Inference params: height=" << height
@@ -597,7 +602,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
               << ", num_images_per_prompt=" << num_images_per_prompt
               << ", seed="
               << (seed.has_value() ? std::to_string(seed.value()) : "none")
-              << ", max_sequence_length=" << max_sequence_length;
+              << ", max_sequence_length=" << max_sequence_length
+              << ", enable_prompt_rewrite="
+              << (enable_prompt_rewrite ? "true" : "false");
     if (prompt.has_value()) {
       for (size_t i = 0; i < prompt.value().size(); ++i) {
         LOG(INFO) << "[LongCatImage] Prompt[" << i
@@ -616,9 +623,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     bool has_neg_prompt = negative_prompt.has_value() ||
                           (negative_prompt_embeds.has_value() &&
                            negative_pooled_prompt_embeds.has_value());
-    bool do_true_cfg = (true_cfg_scale > 1.0f) && has_neg_prompt;
+    // Match Python: do_classifier_free_guidance = guidance_scale > 1
+    // This determines whether to use CFG during denoising
+    bool do_classifier_free_guidance =
+        (guidance_scale > 1.0f) && has_neg_prompt;
 
     // Encode prompt using VLM text encoder
+    // NOTE: Prompt rewriting (enable_prompt_rewrite) should be done in the
+    // Python layer before calling this C++ function. The rewritten prompts are
+    // then passed as input. This is because text_processor requires full VLM
+    // capabilities that are better handled in Python using HuggingFace
+    // transformers.
     torch::Tensor encoded_prompt_embeds;
     torch::Tensor encoded_pooled_embeds;
     torch::Tensor text_ids;
@@ -760,7 +775,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // encode negative prompt
     torch::Tensor negative_encoded_embeds, negative_pooled_embeds;
     torch::Tensor negative_text_ids;
-    if (do_true_cfg) {
+    if (do_classifier_free_guidance) {
       if (negative_prompt_embeds.has_value()) {
         negative_encoded_embeds = negative_prompt_embeds.value();
         negative_pooled_embeds = negative_pooled_prompt_embeds.value();
@@ -849,10 +864,13 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i].unsqueeze(0);
       // timesteps from scheduler are in [0, 1000] range
-      // Pass directly to transformer (no normalization here)
-      // The transformer will handle: timestep.to(hidden_states.dtype) * 1000
-      // which will scale [0, 1000] to [0, 1000000] for the embedding
-      timestep.fill_(t.item<float>()).to(prepared_latents.dtype());
+      // Match Python: timestep = t.expand(latents.shape[0]).to(latents.dtype)
+      //               then pass timestep / 1000 to transformer
+      // The transformer will then do: timestep.to(hidden_states.dtype) * 1000
+      // to restore the original value
+      timestep.fill_(t.item<float>())
+          .to(prepared_latents.dtype())
+          .div_(1000.0f);
       int64_t step_id = i + 1;
       if (i == 0) {
         LOG(INFO) << "[LongCatImage] Step " << i
@@ -905,7 +923,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           << noise_pred_text.max().item<float>();
 
       torch::Tensor noise_pred;
-      if (do_true_cfg) {
+      if (do_classifier_free_guidance) {
         // Forward pass with negative prompt
         torch::Tensor noise_pred_uncond =
             transformer_->forward(prepared_latents,
@@ -921,13 +939,21 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         noise_pred = noise_pred_uncond +
                      guidance_scale * (noise_pred_text - noise_pred_uncond);
 
-        // Optional: cfg_renorm for improved stability
-        // if enable_cfg_renorm:
+        // Optional: cfg_renorm for improved stability (matching Python
+        // implementation) From pipeline_longcat_image.py line 622-626: if
+        // enable_cfg_renorm:
         //     cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
         //     noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
         //     scale = (cond_norm / (noise_norm +
         //     1e-8)).clamp(min=cfg_renorm_min, max=1.0) noise_pred = noise_pred
         //     * scale
+        if (enable_cfg_renorm) {
+          torch::Tensor cond_norm = torch::norm(noise_pred_text, 2, -1, true);
+          torch::Tensor noise_norm = torch::norm(noise_pred, 2, -1, true);
+          torch::Tensor scale =
+              (cond_norm / (noise_norm + 1e-8f)).clamp(cfg_renorm_min, 1.0f);
+          noise_pred = noise_pred * scale;
+        }
 
         noise_pred_uncond.reset();
       } else {
