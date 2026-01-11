@@ -36,9 +36,6 @@ limitations under the License.
 #include "models/model_registry.h"
 #include "models/vlm/qwen2_5_vl.h"
 
-// LongCat-Image pipeline implementation
-// Uses Qwen2_5_VL as text encoder instead of CLIP+T5
-
 namespace xllm {
 
 // Forward declarations
@@ -57,122 +54,7 @@ constexpr const char* PROMPT_TEMPLATE_ENCODE_PREFIX =
 constexpr const char* PROMPT_TEMPLATE_ENCODE_SUFFIX =
     "<|im_end|>\n<|im_start|>assistant\n";
 
-// Standalone position embedding implementation for LongCat-Image
-torch::Tensor get_1d_rotary_pos_embed(
-    int64_t dim,
-    const torch::Tensor& pos,
-    float theta = 10000.0,
-    bool use_real = false,
-    float linear_factor = 1.0,
-    float ntk_factor = 1.0,
-    bool repeat_interleave_real = true,
-    torch::Dtype freqs_dtype = torch::kFloat32) {
-  CHECK_EQ(dim % 2, 0) << "Dimension must be even";
-
-  torch::Tensor pos_tensor = pos;
-  if (pos.dim() == 0) {
-    pos_tensor = torch::arange(pos.item<int64_t>(), pos.options());
-  }
-
-  theta = theta * ntk_factor;
-
-  auto freqs =
-      1.0 /
-      (torch::pow(
-           theta,
-           torch::arange(
-               0, dim, 2, torch::dtype(freqs_dtype).device(pos.device())) /
-               dim) *
-       linear_factor);  // [D/2]
-
-  auto tensors = {pos_tensor, freqs};
-
-  auto freqs_outer = torch::einsum("s,d->sd", tensors);  // [S, D/2]
-  freqs_outer = freqs_outer.to(torch::kFloat32);
-
-  if (use_real && repeat_interleave_real) {
-    auto cos_vals = torch::cos(freqs_outer);  // [S, D/2]
-    auto sin_vals = torch::sin(freqs_outer);  // [S, D/2]
-
-    auto freqs_cos = cos_vals.transpose(-1, -2)
-                         .repeat_interleave(2, -2)
-                         .transpose(-1, -2)
-                         .to(torch::kFloat32);  // [S, D]
-
-    auto freqs_sin = sin_vals.transpose(-1, -2)
-                         .repeat_interleave(2, -2)
-                         .transpose(-1, -2)
-                         .to(torch::kFloat32);  // [S, D]
-    return torch::cat({freqs_cos.unsqueeze(0), freqs_sin.unsqueeze(0)},
-                      0);  // [2, S, D]
-  }
-  return torch::Tensor();
-}
-
-class LongCatImagePosEmbedImpl : public torch::nn::Module {
- public:
-  LongCatImagePosEmbedImpl(int64_t theta, std::vector<int64_t> axes_dim) {
-    theta_ = theta;
-    axes_dim_ = axes_dim;
-  }
-
-  std::pair<torch::Tensor, torch::Tensor> forward_cache(
-      const torch::Tensor& txt_ids,
-      const torch::Tensor& img_ids,
-      int64_t height = -1,
-      int64_t width = -1) {
-    auto seq_len = txt_ids.size(0);
-
-    // recompute the cache if height or width changes
-    if (height != cached_image_height_ || width != cached_image_width_ ||
-        seq_len != max_seq_len_) {
-      torch::Tensor ids = torch::cat({txt_ids, img_ids}, 0);
-      cached_image_height_ = height;
-      cached_image_width_ = width;
-      max_seq_len_ = seq_len;
-      auto [cos, sin] = forward(ids);
-      freqs_cos_cache_ = std::move(cos);
-      freqs_sin_cache_ = std::move(sin);
-    }
-    return {freqs_cos_cache_, freqs_sin_cache_};
-  }
-
-  std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& ids) {
-    int64_t n_axes = ids.size(-1);
-    std::vector<torch::Tensor> cos_out, sin_out;
-    auto pos = ids.to(torch::kFloat32);
-    torch::Dtype freqs_dtype = torch::kFloat64;
-    for (int64_t i = 0; i < n_axes; ++i) {
-      auto pos_slice = pos.select(-1, i);
-      auto result = get_1d_rotary_pos_embed(axes_dim_[i],
-                                            pos_slice,
-                                            theta_,
-                                            true,  // repeat_interleave_real
-                                            1,
-                                            1,
-                                            true,  // use_real
-                                            freqs_dtype);
-      auto cos = result[0];
-      auto sin = result[1];
-      cos_out.push_back(cos);
-      sin_out.push_back(sin);
-    }
-
-    auto freqs_cos = torch::cat(cos_out, -1);
-    auto freqs_sin = torch::cat(sin_out, -1);
-    return {freqs_cos, freqs_sin};
-  }
-
- private:
-  int64_t theta_;
-  std::vector<int64_t> axes_dim_;
-  torch::Tensor freqs_cos_cache_;
-  torch::Tensor freqs_sin_cache_;
-  int64_t max_seq_len_ = -1;
-  int64_t cached_image_height_ = -1;
-  int64_t cached_image_width_ = -1;
-};
-TORCH_MODULE(LongCatImagePosEmbed);
+// get_1d_rotary_pos_embed and LongCatImagePosEmbed are defined in dit.h
 
 float calculate_shift(int64_t image_seq_len,
                       int64_t base_seq_len = 256,
@@ -330,6 +212,10 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                      context.get_model_args("scheduler"),
                      context.get_quant_args("scheduler"),
                      context.get_tensor_options()));
+    // Prompt template for encoding
+    prompt_template_encode_prefix_ = std::string(PROMPT_TEMPLATE_ENCODE_PREFIX);
+    prompt_template_encode_suffix_ = std::string(PROMPT_TEMPLATE_ENCODE_SUFFIX);
+
     register_module("vae", vae_);
     register_module("vae_image_processor", vae_image_processor_);
     register_module("transformer", transformer_);
@@ -510,6 +396,270 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     }
   }
 
+  // Prepare text position IDs for text tokens
+  torch::Tensor prepare_text_ids(int64_t num_tokens,
+                                 int64_t start_height = 0,
+                                 int64_t start_width = 0) {
+    torch::Tensor text_ids = torch::zeros({num_tokens, 3}, options_);
+    // modality_id = 0 for text
+    text_ids.select(1, 0).fill_(0);
+    // position indices
+    torch::Tensor token_range = torch::arange(num_tokens, options_);
+    text_ids.select(1, 1) = token_range + start_height;
+    text_ids.select(1, 2) = token_range + start_width;
+    return text_ids;
+  }
+
+  // Prepare image position IDs for latent image tokens
+  torch::Tensor prepare_latent_image_ids(int64_t batch_size,
+                                         int64_t height,
+                                         int64_t width) {
+    torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options_);
+    // modality_id = 1 for image
+    latent_image_ids.select(2, 0).fill_(1);
+    torch::Tensor height_range = torch::arange(height, options_).unsqueeze(1);
+    latent_image_ids.select(2, 1) += height_range;
+    torch::Tensor width_range = torch::arange(width, options_).unsqueeze(0);
+    latent_image_ids.select(2, 2) += width_range;
+    latent_image_ids = latent_image_ids.view({height * width, 3});
+    return latent_image_ids;
+  }
+
+  torch::Tensor pack_latents(const torch::Tensor& latents,
+                             int64_t batch_size,
+                             int64_t num_channels_latents,
+                             int64_t height,
+                             int64_t width) {
+    torch::Tensor latents_packed = latents.view(
+        {batch_size, num_channels_latents, height / 2, 2, width / 2, 2});
+    latents_packed = latents_packed.permute({0, 2, 4, 1, 3, 5});
+    latents_packed = latents_packed.reshape(
+        {batch_size, (height / 2) * (width / 2), num_channels_latents * 4});
+
+    return latents_packed;
+  }
+
+  torch::Tensor unpack_latents(const torch::Tensor& latents,
+                               int64_t height,
+                               int64_t width,
+                               int64_t vae_scale_factor) {
+    int64_t batch_size = latents.size(0);
+    int64_t num_patches = latents.size(1);
+    int64_t channels = latents.size(2);
+    height = 2 * (height / (vae_scale_factor * 2));
+    width = 2 * (width / (vae_scale_factor * 2));
+
+    torch::Tensor latents_unpacked =
+        latents.view({batch_size, height / 2, width / 2, channels / 4, 2, 2});
+    latents_unpacked = latents_unpacked.permute({0, 3, 1, 4, 2, 5});
+    latents_unpacked = latents_unpacked.reshape(
+        {batch_size, channels / (2 * 2), height, width});
+
+    return latents_unpacked;
+  }
+
+  std::pair<torch::Tensor, torch::Tensor> prepare_latents(
+      int64_t batch_size,
+      int64_t num_channels_latents,
+      int64_t height,
+      int64_t width,
+      int64_t seed,
+      std::optional<torch::Tensor> latents = std::nullopt) {
+    int64_t adjusted_height = 2 * (height / (vae_scale_factor_ * 2));
+    int64_t adjusted_width = 2 * (width / (vae_scale_factor_ * 2));
+    std::vector<int64_t> shape = {
+        batch_size, num_channels_latents, adjusted_height, adjusted_width};
+    if (latents.has_value()) {
+      torch::Tensor latent_image_ids = prepare_latent_image_ids(
+          batch_size, adjusted_height / 2, adjusted_width / 2);
+      return {latents.value(), latent_image_ids};
+    }
+    torch::Tensor latents_tensor = randn_tensor(shape, seed, options_);
+    torch::Tensor packed_latents = pack_latents(latents_tensor,
+                                                batch_size,
+                                                num_channels_latents,
+                                                adjusted_height,
+                                                adjusted_width);
+    torch::Tensor latent_image_ids = prepare_latent_image_ids(
+        batch_size, adjusted_height / 2, adjusted_width / 2);
+    return {packed_latents, latent_image_ids};
+  }
+
+  // Helper function: split quotation marks (simplified version)
+  // For full regex-based implementation, see diffusers implementation
+  static std::vector<std::pair<std::string, bool>> split_quotation(
+      const std::string& prompt_text) {
+    std::vector<std::pair<std::string, bool>> result;
+    std::string current;
+    bool in_quotes = false;
+    char quote_char = '\0';
+
+    for (size_t i = 0; i < prompt_text.length(); ++i) {
+      char c = prompt_text[i];
+      if ((c == '\'' || c == '\"') && !in_quotes) {
+        if (!current.empty()) {
+          result.push_back({current, false});
+          current.clear();
+        }
+        in_quotes = true;
+        quote_char = c;
+        current += c;
+      } else if (in_quotes && c == quote_char) {
+        current += c;
+        result.push_back({current, true});
+        current.clear();
+        in_quotes = false;
+        quote_char = '\0';
+      } else {
+        current += c;
+      }
+    }
+    if (!current.empty()) {
+      result.push_back({current, in_quotes});
+    }
+    return result;
+  }
+
+  // Encode prompt using Qwen2_5_VL text encoder
+  torch::Tensor encode_prompt_qwen(std::vector<std::string>& prompt,
+                                   int64_t num_images_per_prompt = 1,
+                                   int64_t max_sequence_length = 512) {
+    CHECK(tokenizer_ != nullptr) << "Tokenizer not loaded";
+    CHECK(!text_encoder_.is_empty()) << "Text encoder not loaded";
+
+    int64_t batch_size = prompt.size();
+    std::vector<std::vector<int32_t>> batch_all_tokens;
+    batch_all_tokens.reserve(batch_size);
+
+    // Step 1: Tokenize prompts with split_quotation handling
+    for (const auto& each_prompt : prompt) {
+      std::vector<int32_t> all_tokens;
+      auto parts = split_quotation(each_prompt);
+
+      for (const auto& [clean_prompt_sub, matched] : parts) {
+        if (matched) {
+          // For quoted text, tokenize character by character (simplified)
+          // In Python, it's tokenized as-is
+          std::vector<int32_t> tokens;
+          if (tokenizer_->encode(clean_prompt_sub, &tokens, false)) {
+            all_tokens.insert(all_tokens.end(), tokens.begin(), tokens.end());
+          }
+        } else {
+          std::vector<int32_t> tokens;
+          if (tokenizer_->encode(clean_prompt_sub, &tokens, false)) {
+            all_tokens.insert(all_tokens.end(), tokens.begin(), tokens.end());
+          }
+        }
+      }
+
+      // Truncate if too long
+      if (static_cast<int64_t>(all_tokens.size()) > max_sequence_length) {
+        LOG(WARNING) << "Input truncated from " << all_tokens.size() << " to "
+                     << max_sequence_length << " tokens";
+        all_tokens.resize(max_sequence_length);
+      }
+
+      batch_all_tokens.push_back(all_tokens);
+    }
+
+    // Step 2: Pad tokens to max_sequence_length
+    // Find pad_token_id (typically 151643 for Qwen2, but we'll use 0 as
+    // default)
+    int32_t pad_token_id = 0;
+    auto pad_id = tokenizer_->token_to_id("<|endoftext|>");
+    if (pad_id.has_value()) {
+      pad_token_id = pad_id.value();
+    }
+
+    // Pad each sequence
+    for (auto& tokens : batch_all_tokens) {
+      int64_t pad_len =
+          max_sequence_length - static_cast<int64_t>(tokens.size());
+      if (pad_len > 0) {
+        tokens.insert(tokens.end(), pad_len, pad_token_id);
+      }
+    }
+
+    // Step 3: Tokenize prefix and suffix templates
+    std::vector<int32_t> prefix_tokens;
+    CHECK(tokenizer_->encode(
+        prompt_template_encode_prefix_, &prefix_tokens, false));
+    std::vector<int32_t> suffix_tokens;
+    CHECK(tokenizer_->encode(
+        prompt_template_encode_suffix_, &suffix_tokens, false));
+    int64_t prefix_len = prefix_tokens.size();
+    int64_t suffix_len = suffix_tokens.size();
+
+    // Step 4: Concatenate prefix + tokens + suffix
+    int64_t total_seq_len = prefix_len + max_sequence_length + suffix_len;
+    std::vector<int32_t> input_ids_flat;
+    input_ids_flat.reserve(batch_size * total_seq_len);
+
+    for (int64_t i = 0; i < batch_size; ++i) {
+      // Add prefix
+      input_ids_flat.insert(
+          input_ids_flat.end(), prefix_tokens.begin(), prefix_tokens.end());
+      // Add tokens
+      input_ids_flat.insert(input_ids_flat.end(),
+                            batch_all_tokens[i].begin(),
+                            batch_all_tokens[i].end());
+      // Add suffix
+      input_ids_flat.insert(
+          input_ids_flat.end(), suffix_tokens.begin(), suffix_tokens.end());
+    }
+
+    // Create input_ids tensor [batch_size, total_seq_len]
+    torch::Tensor input_ids =
+        torch::tensor(input_ids_flat, torch::dtype(torch::kLong))
+            .view({batch_size, total_seq_len})
+            .to(options_.device());
+
+    // Step 5: Get embeddings from text encoder
+    // Note: get_input_embeddings returns input embeddings, not hidden states
+    // TODO: Need to implement full forward pass to get hidden states from
+    // transformer layers
+    ModelInputParams input_params;
+    torch::Tensor prompt_embeds =
+        text_encoder_->get_input_embeddings(input_ids, input_params);
+
+    // prompt_embeds shape: [batch_size, total_seq_len, hidden_size]
+    // Remove prefix and suffix tokens
+    prompt_embeds =
+        prompt_embeds.slice(1, prefix_len, total_seq_len - suffix_len);
+    // Now shape: [batch_size, max_sequence_length, hidden_size]
+
+    // Step 6: Repeat for num_images_per_prompt
+    prompt_embeds = prompt_embeds.repeat({1, num_images_per_prompt, 1});
+    prompt_embeds = prompt_embeds.view(
+        {batch_size * num_images_per_prompt, max_sequence_length, -1});
+
+    return prompt_embeds.to(options_);
+  }
+
+  std::pair<torch::Tensor, torch::Tensor> encode_prompt(
+      std::optional<std::vector<std::string>> prompt,
+      std::optional<torch::Tensor> prompt_embeds,
+      int64_t num_images_per_prompt = 1,
+      int64_t max_sequence_length = 512) {
+    std::vector<std::string> prompt_list;
+    if (prompt.has_value()) {
+      prompt_list = prompt.value();
+    }
+    if (prompt_list.empty()) {
+      prompt_list = {""};
+    }
+
+    if (!prompt_embeds.has_value()) {
+      prompt_embeds = encode_prompt_qwen(
+          prompt_list, num_images_per_prompt, max_sequence_length);
+    }
+
+    int64_t seq_len = prompt_embeds.value().size(1);
+    torch::Tensor text_ids = prepare_text_ids(seq_len);
+
+    return {prompt_embeds.value(), text_ids};
+  }
+
  private:
   // Model context (saved for use in load_model)
   DiTModelContext context_;
@@ -532,47 +682,8 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   FlowMatchEulerDiscreteScheduler scheduler_{nullptr};
   std::unique_ptr<Tokenizer> tokenizer_;
   Qwen2_5_VLForConditionalGeneration text_encoder_{nullptr};
-
-  std::pair<torch::Tensor, torch::Tensor> prepare_latents(
-      int64_t batch_size,
-      int64_t num_channels_latents,
-      int64_t height,
-      int64_t width,
-      int64_t seed,
-      std::optional<torch::Tensor> latents = std::nullopt) {
-    int64_t adjusted_height = 2 * (height / (vae_scale_factor_ * 2));
-    int64_t adjusted_width = 2 * (width / (vae_scale_factor_ * 2));
-    LOG(INFO) << "[LongCatImage] prepare_latents: height=" << height
-              << ", width=" << width
-              << ", vae_scale_factor_=" << vae_scale_factor_
-              << ", adjusted_height=" << adjusted_height
-              << ", adjusted_width=" << adjusted_width
-              << ", num_channels_latents=" << num_channels_latents;
-    std::vector<int64_t> shape = {
-        batch_size, num_channels_latents, adjusted_height, adjusted_width};
-    if (latents.has_value()) {
-      torch::Tensor latent_image_ids =
-          prepare_latent_image_ids(adjusted_height / 2,
-                                   adjusted_width / 2,
-                                   tokenizer_max_length_,
-                                   tokenizer_max_length_,
-                                   options_);
-      return {latents.value(), latent_image_ids};
-    }
-    torch::Tensor latents_tensor = randn_tensor(shape, seed, options_);
-    torch::Tensor packed_latents = pack_latents(latents_tensor,
-                                                batch_size,
-                                                num_channels_latents,
-                                                adjusted_height,
-                                                adjusted_width);
-    torch::Tensor latent_image_ids =
-        prepare_latent_image_ids(adjusted_height / 2,
-                                 adjusted_width / 2,
-                                 tokenizer_max_length_,
-                                 tokenizer_max_length_,
-                                 options_);
-    return {packed_latents, latent_image_ids};
-  }
+  std::string prompt_template_encode_prefix_;
+  std::string prompt_template_encode_suffix_;
 
   std::vector<torch::Tensor> forward_(
       std::optional<std::vector<std::string>> prompt = std::nullopt,
@@ -580,235 +691,51 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       std::optional<std::vector<std::string>> negative_prompt = std::nullopt,
       std::optional<std::vector<std::string>> negative_prompt_2 = std::nullopt,
       float true_cfg_scale = 1.0f,
-      int64_t height = 512,
-      int64_t width = 512,
-      int64_t num_inference_steps = 28,
-      float guidance_scale = 3.5f,
+      int64_t height = 768,
+      int64_t width = 1344,
+      int64_t num_inference_steps = 50,
+      float guidance_scale = 4.5f,
       int64_t num_images_per_prompt = 1,
       std::optional<int64_t> seed = std::nullopt,
       std::optional<torch::Tensor> latents = std::nullopt,
       std::optional<torch::Tensor> prompt_embeds = std::nullopt,
-      std::optional<torch::Tensor> pooled_prompt_embeds = std::nullopt,
       std::optional<torch::Tensor> negative_prompt_embeds = std::nullopt,
+      std::optional<torch::Tensor> pooled_prompt_embeds = std::nullopt,
       std::optional<torch::Tensor> negative_pooled_prompt_embeds = std::nullopt,
       int64_t max_sequence_length = 512,
       bool enable_cfg_renorm = true,
-      float cfg_renorm_min = 0.0f,
-      bool enable_prompt_rewrite = false) {
+      float cfg_renorm_min = 0.0f) {
     torch::NoGradGuard no_grad;
-    // 打印推理参数
-    LOG(INFO) << "[LongCatImage] Inference params: height=" << height
-              << ", width=" << width
-              << ", num_inference_steps=" << num_inference_steps
-              << ", guidance_scale=" << guidance_scale
-              << ", num_images_per_prompt=" << num_images_per_prompt
-              << ", seed="
-              << (seed.has_value() ? std::to_string(seed.value()) : "none")
-              << ", max_sequence_length=" << max_sequence_length
-              << ", enable_prompt_rewrite="
-              << (enable_prompt_rewrite ? "true" : "false");
-    if (prompt.has_value()) {
-      for (size_t i = 0; i < prompt.value().size(); ++i) {
-        LOG(INFO) << "[LongCatImage] Prompt[" << i
-                  << "]: " << prompt.value()[i];
-      }
-    }
     int64_t batch_size;
     if (prompt.has_value()) {
       batch_size = prompt.value().size();
     } else {
-      batch_size = prompt_embeds.value().size(0);
+      batch_size = prompt_embeds.value().size(0) / num_images_per_prompt;
     }
-    int64_t total_batch_size = batch_size * num_images_per_prompt;  // 1=1*1
-    LOG(INFO) << "[dragon]: batch_size(" << batch_size << "), total_batch_size("
-              << total_batch_size << ")";
-    bool has_neg_prompt = negative_prompt.has_value() ||
-                          (negative_prompt_embeds.has_value() &&
-                           negative_pooled_prompt_embeds.has_value());
-    // Match Python: do_classifier_free_guidance = guidance_scale > 1
-    // This determines whether to use CFG during denoising
+    int64_t total_batch_size = batch_size * num_images_per_prompt;
+
     bool do_classifier_free_guidance =
-        (guidance_scale > 1.0f) && has_neg_prompt;
+        (guidance_scale > 1.0f) &&
+        (negative_prompt.has_value() || negative_prompt_embeds.has_value());
 
-    // Encode prompt using VLM text encoder
-    // NOTE: Prompt rewriting (enable_prompt_rewrite) should be done in the
-    // Python layer before calling this C++ function. The rewritten prompts are
-    // then passed as input. This is because text_processor requires full VLM
-    // capabilities that are better handled in Python using HuggingFace
-    // transformers.
-    torch::Tensor encoded_prompt_embeds;
-    torch::Tensor encoded_pooled_embeds;
-    torch::Tensor text_ids;
+    // Encode prompt
+    auto [encoded_prompt_embeds, text_ids] = encode_prompt(
+        prompt, prompt_embeds, num_images_per_prompt, max_sequence_length);
 
-    if (prompt_embeds.has_value()) {
-      encoded_prompt_embeds = prompt_embeds.value();
-      encoded_pooled_embeds = pooled_prompt_embeds.value();
-    } else {
-      // Use VLM text encoder to encode prompts
-      if (text_encoder_ && prompt.has_value()) {
-        LOG(INFO) << "Encoding prompts using VLM text encoder";
-        try {
-          // Tokenize prompts
-          std::vector<std::vector<int32_t>> text_input_ids;
-          text_input_ids.reserve(total_batch_size);
-
-          // Repeat prompts for num_images_per_prompt
-          std::vector<std::string> repeated_prompts;
-          for (const auto& p : prompt.value()) {
-            for (int64_t i = 0; i < num_images_per_prompt; ++i) {
-              repeated_prompts.push_back(p);
-            }
-          }
-
-          if (tokenizer_ &&
-              tokenizer_->batch_encode(repeated_prompts, &text_input_ids)) {
-            LOG(INFO) << "[DEBUG] batch_encode result: true";
-            for (size_t i = 0; i < text_input_ids.size(); ++i) {
-              std::string ids_str;
-              if (!text_input_ids[i].empty()) {
-                ids_str =
-                    "size=" + std::to_string(text_input_ids[i].size()) +
-                    ", first_token=" + std::to_string(text_input_ids[i][0]);
-              } else {
-                ids_str = "empty";
-              }
-              LOG(INFO) << "[DEBUG] text_input_ids[" << i << "]: " << ids_str;
-            }
-            // Truncate or pad to max_sequence_length
-            for (auto& ids : text_input_ids) {
-              if (ids.size() > max_sequence_length) {
-                ids.resize(max_sequence_length);
-              } else if (ids.size() < max_sequence_length) {
-                ids.resize(max_sequence_length, 0);  // Pad with 0
-              }
-            }
-
-            // Convert to tensor
-            std::vector<int32_t> input_ids_flat;
-            input_ids_flat.reserve(total_batch_size * max_sequence_length);
-            for (const auto& ids : text_input_ids) {
-              input_ids_flat.insert(
-                  input_ids_flat.end(), ids.begin(), ids.end());
-            }
-
-            auto input_ids =
-                torch::tensor(input_ids_flat, torch::dtype(torch::kLong))
-                    .view({total_batch_size, max_sequence_length})
-                    .to(options_.device());
-            // 打印 input_ids 内容和统计信息
-            LOG(INFO) << "[LongCatImage] input_ids shape: "
-                      << input_ids.sizes();
-            LOG(INFO) << "[LongCatImage] input_ids min: "
-                      << input_ids.min().item<int64_t>()
-                      << ", max: " << input_ids.max().item<int64_t>();
-            LOG(INFO) << "[LongCatImage] input_ids[0][0:8]: "
-                      << input_ids[0].slice(0, 0, 8);
-
-            // Encode using VLM text encoder
-            torch::NoGradGuard no_grad;
-            // Get input embeddings from the language model
-            auto input_embeds = text_encoder_->get_input_embeddings(
-                input_ids, ModelInputParams());
-
-            // Use the embeddings as prompt embeddings
-            encoded_prompt_embeds = input_embeds;
-            // Use mean pooling as pooled embeddings
-            encoded_pooled_embeds = input_embeds.mean(1);
-
-            LOG(INFO) << "VLM text encoding successful";
-            LOG(INFO) << "[LongCatImage] Encoded prompt_embeds shape: "
-                      << encoded_prompt_embeds.sizes();  // [1, 512, 3584]
-            LOG(INFO) << "[LongCatImage] Encoded pooled_embeds shape: "
-                      << encoded_pooled_embeds.sizes();  // [1, 3584]
-            // 打印 embedding 内容和统计信息
-            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds shape: "
-                      << encoded_prompt_embeds.sizes();
-            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds min: "
-                      << encoded_prompt_embeds.min().item<float>()
-                      << ", max: " << encoded_prompt_embeds.max().item<float>()
-                      << ", mean: "
-                      << encoded_prompt_embeds.mean().item<float>();
-            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds shape: "
-                      << encoded_pooled_embeds.sizes();
-            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds min: "
-                      << encoded_pooled_embeds.min().item<float>()
-                      << ", max: " << encoded_pooled_embeds.max().item<float>()
-                      << ", mean: "
-                      << encoded_pooled_embeds.mean().item<float>();
-            LOG(INFO) << "[LongCatImage] encoded_prompt_embeds[0][0][0:8]: "
-                      << encoded_prompt_embeds[0][0].slice(0, 0, 8);
-            LOG(INFO) << "[LongCatImage] encoded_pooled_embeds[0][0:8]: "
-                      << encoded_pooled_embeds[0].slice(0, 0, 8);
-          } else {
-            throw std::runtime_error("Failed to tokenize prompts");
-          }
-        } catch (const std::exception& e) {
-          LOG(WARNING) << "VLM text encoding failed: " << e.what()
-                       << ", falling back to dummy embeddings";
-          goto use_dummy_embeddings;
-        }
-      } else {
-      use_dummy_embeddings:
-        LOG(WARNING)
-            << "Using dummy text embeddings - VLM text encoder not available";
-        // Create dummy embeddings for testing
-        int64_t hidden_size = 3584;  // joint_attention_dim from config
-        int64_t pooled_projection_dim =
-            3584;  // pooled_projection_dim from config
-        encoded_prompt_embeds = torch::zeros(
-            {total_batch_size, max_sequence_length, hidden_size}, options_);
-        encoded_pooled_embeds = torch::zeros(
-            at::IntArrayRef({total_batch_size, pooled_projection_dim}),
-            options_);
-      }
-    }
-
-    // Prepare text_ids with modality_id (0) and position information
-    text_ids =
-        torch::zeros({max_sequence_length, 3},
-                     torch::dtype(torch::kLong).device(options_.device()));
-    text_ids.select(1, 0).fill_(0);  // modality_id = 0 for text
-    torch::Tensor pos_range =
-        torch::arange(max_sequence_length,
-                      torch::dtype(torch::kLong).device(options_.device()));
-    text_ids.select(1, 1) += pos_range;  // position index
-    text_ids.select(1, 2) += pos_range;  // position index
-
-    // encode negative prompt
-    torch::Tensor negative_encoded_embeds, negative_pooled_embeds;
+    // Encode negative prompt
+    torch::Tensor negative_encoded_embeds;
     torch::Tensor negative_text_ids;
     if (do_classifier_free_guidance) {
-      if (negative_prompt_embeds.has_value()) {
-        negative_encoded_embeds = negative_prompt_embeds.value();
-        negative_pooled_embeds = negative_pooled_prompt_embeds.value();
-      } else {
-        int64_t hidden_size = 3584;  // joint_attention_dim from config
-        int64_t pooled_projection_dim =
-            3584;  // pooled_projection_dim from config
-        negative_encoded_embeds = torch::zeros(
-            {total_batch_size, max_sequence_length, hidden_size}, options_);
-        negative_pooled_embeds = torch::zeros(
-            at::IntArrayRef({total_batch_size, pooled_projection_dim}),
-            options_);
-      }
-      // Prepare negative_text_ids with modality_id (0) and position information
-      negative_text_ids =
-          torch::zeros({max_sequence_length, 3},
-                       torch::dtype(torch::kLong).device(options_.device()));
-      negative_text_ids.select(1, 0).fill_(0);  // modality_id = 0 for text
-      torch::Tensor neg_pos_range =
-          torch::arange(max_sequence_length,
-                        torch::dtype(torch::kLong).device(options_.device()));
-      negative_text_ids.select(1, 1) += neg_pos_range;  // position index
-      negative_text_ids.select(1, 2) += neg_pos_range;  // position index
+      auto [neg_emb, neg_ids] = encode_prompt(negative_prompt,
+                                              negative_prompt_embeds,
+                                              num_images_per_prompt,
+                                              max_sequence_length);
+      negative_encoded_embeds = neg_emb;
+      negative_text_ids = neg_ids;
     }
 
-    // prepare latent
-    int64_t num_channels_latents = transformer_->in_channels() / 4;
-    LOG(INFO) << "[LongCatImage] transformer_->in_channels()="
-              << transformer_->in_channels()
-              << ", num_channels_latents=" << num_channels_latents
-              << ", vae_scale_factor_=" << vae_scale_factor_;
+    // Prepare latent variables
+    int64_t num_channels_latents = 16;  // LongCat-Image uses 16 channels
     auto [prepared_latents, latent_image_ids] =
         prepare_latents(total_batch_size,
                         num_channels_latents,
@@ -816,12 +743,8 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                         width,
                         seed.has_value() ? seed.value() : 42,
                         latents);
-    LOG(INFO) << "[LongCatImage] After prepare_latents: shape="
-              << prepared_latents.sizes()
-              << ", min/max=" << prepared_latents.min().item<float>() << "/"
-              << prepared_latents.max().item<float>();
 
-    // prepare timestep
+    // Prepare timesteps
     std::vector<float> new_sigmas;
     for (int64_t i = 0; i < num_inference_steps; ++i) {
       new_sigmas.push_back(1.0f - static_cast<float>(i) /
@@ -837,197 +760,76 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                scheduler_->max_shift());
     auto [timesteps, num_inference_steps_actual] = retrieve_timesteps(
         scheduler_, num_inference_steps, options_.device(), new_sigmas, mu);
-    int64_t num_warmup_steps =
-        std::max(static_cast<int64_t>(timesteps.numel()) -
-                     num_inference_steps_actual * scheduler_->order(),
-                 static_cast<int64_t>(0LL));
 
-    // prepare guidance
-    torch::Tensor guidance;
-    if (transformer_->guidance_embeds()) {
-      torch::TensorOptions options =
-          torch::dtype(torch::kFloat32).device(options_.device());
-
-      guidance = torch::full(at::IntArrayRef({1}), guidance_scale, options);
-      guidance = guidance.expand({prepared_latents.size(0)});
-    }
     scheduler_->set_begin_index(0);
     torch::Tensor timestep =
         torch::empty({prepared_latents.size(0)}, prepared_latents.options());
 
-    // image rotary positional embeddings outplace computation
+    // Image rotary positional embeddings
     auto [rot_emb1, rot_emb2] =
         pos_embed_->forward_cache(text_ids,
                                   latent_image_ids,
                                   height / (vae_scale_factor_ * 2),
                                   width / (vae_scale_factor_ * 2));
-    torch::Tensor image_rotary_emb = torch::stack({rot_emb1, rot_emb2}, 0);
+    std::vector<torch::Tensor> rot_embs = {rot_emb1, rot_emb2};
+    torch::Tensor image_rotary_emb = torch::stack(rot_embs, 0);
 
+    // Denoising loop
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i].unsqueeze(0);
-      // timesteps from scheduler are in [0, 1000] range
-      // Match Python: timestep = t.expand(latents.shape[0]).to(latents.dtype)
-      //               then pass timestep / 1000 to transformer
-      // The transformer will then do: timestep.to(hidden_states.dtype) * 1000
-      // to restore the original value
       timestep.fill_(t.item<float>())
           .to(prepared_latents.dtype())
           .div_(1000.0f);
-      int64_t step_id = i + 1;
-      if (i == 0) {
-        LOG(INFO) << "[LongCatImage] Step " << i
-                  << ": prepared_latents min/max before forward: "
-                  << prepared_latents.min().item<float>() << "/"
-                  << prepared_latents.max().item<float>();
-      }
-      LOG(INFO) << "[DEBUG] transformer->forward() 输入: latent min/max: "
-                << prepared_latents.min().item<float>() << "/"
-                << prepared_latents.max().item<float>()
-                << ", prompt_embeds min/max: "
-                << encoded_prompt_embeds.min().item<float>() << "/"
-                << encoded_prompt_embeds.max().item<float>()
-                << ", pooled_embeds min/max: "
-                << encoded_pooled_embeds.min().item<float>() << "/"
-                << encoded_pooled_embeds.max().item<float>()
-                << ", timestep min/max: " << timestep.min().item<float>() << "/"
-                << timestep.max().item<float>()
-                << ", image_rotary_emb min/max: "
-                << image_rotary_emb.min().item<float>() << "/"
-                << image_rotary_emb.max().item<float>();
-      // Check for NaN in inputs
-      if (torch::isnan(prepared_latents).any().item<bool>()) {
-        LOG(ERROR) << "NaN detected in prepared_latents!";
-      }
-      if (torch::isnan(encoded_prompt_embeds).any().item<bool>()) {
-        LOG(ERROR) << "NaN detected in encoded_prompt_embeds!";
-      }
-      if (torch::isnan(encoded_pooled_embeds).any().item<bool>()) {
-        LOG(ERROR) << "NaN detected in encoded_pooled_embeds!";
-      }
-      if (torch::isnan(timestep).any().item<bool>()) {
-        LOG(ERROR) << "NaN detected in timestep!";
-      }
-      if (torch::isnan(image_rotary_emb).any().item<bool>()) {
-        LOG(ERROR) << "NaN detected in image_rotary_emb!";
-      }
-      // Forward pass with text prompt
-      torch::Tensor noise_pred_text =
-          transformer_->forward(prepared_latents,
-                                encoded_prompt_embeds,
-                                encoded_pooled_embeds,
-                                timestep,
-                                image_rotary_emb,
-                                guidance,
-                                step_id);
-      LOG(INFO)
-          << "[DEBUG] transformer->forward() 输出: noise_pred_text min/max: "
-          << noise_pred_text.min().item<float>() << "/"
-          << noise_pred_text.max().item<float>();
 
-      torch::Tensor noise_pred;
+      // Forward through transformer
+      torch::Tensor noise_pred = transformer_->forward(
+          prepared_latents, encoded_prompt_embeds, timestep, image_rotary_emb);
+
       if (do_classifier_free_guidance) {
-        // Forward pass with negative prompt
-        torch::Tensor noise_pred_uncond =
+        // Forward negative prompt
+        torch::Tensor negative_noise_pred =
             transformer_->forward(prepared_latents,
                                   negative_encoded_embeds,
-                                  negative_pooled_embeds,
                                   timestep,
-                                  image_rotary_emb,
-                                  guidance,
-                                  step_id);
-        // Classifier Free Guidance:
-        // noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text -
-        // noise_pred_uncond)
-        noise_pred = noise_pred_uncond +
-                     guidance_scale * (noise_pred_text - noise_pred_uncond);
+                                  image_rotary_emb);
 
-        // Optional: cfg_renorm for improved stability (matching Python
-        // implementation) From pipeline_longcat_image.py line 622-626: if
-        // enable_cfg_renorm:
-        //     cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
-        //     noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-        //     scale = (cond_norm / (noise_norm +
-        //     1e-8)).clamp(min=cfg_renorm_min, max=1.0) noise_pred = noise_pred
-        //     * scale
+        // Save conditional prediction before CFG
+        torch::Tensor noise_pred_text = noise_pred;
+
+        // Classifier-free guidance
+        noise_pred = negative_noise_pred +
+                     guidance_scale * (noise_pred_text - negative_noise_pred);
+
+        // CFG renorm
         if (enable_cfg_renorm) {
           torch::Tensor cond_norm = torch::norm(noise_pred_text, 2, -1, true);
           torch::Tensor noise_norm = torch::norm(noise_pred, 2, -1, true);
-          torch::Tensor scale =
-              (cond_norm / (noise_norm + 1e-8f)).clamp(cfg_renorm_min, 1.0f);
+          torch::Tensor scale = (cond_norm / (noise_norm + 1e-8f))
+                                    .clamp_min(cfg_renorm_min)
+                                    .clamp_max(1.0f);
           noise_pred = noise_pred * scale;
         }
-
-        noise_pred_uncond.reset();
-      } else {
-        noise_pred = noise_pred_text;
       }
-      noise_pred_text.reset();
 
-      if (i == 0 || i == timesteps.numel() - 1) {
-        LOG(INFO) << "[LongCatImage] Step " << i
-                  << ": noise_pred min/max: " << noise_pred.min().item<float>()
-                  << "/" << noise_pred.max().item<float>();
-      }
+      // Scheduler step
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
-      if (i == 0 || i == timesteps.numel() - 1) {
-        LOG(INFO) << "[LongCatImage] Step " << i
-                  << ": prev_latents (before detach) min/max: "
-                  << prev_latents.min().item<float>() << "/"
-                  << prev_latents.max().item<float>();
-      }
       prepared_latents = prev_latents.detach();
-      std::vector<torch::Tensor> tensors = {prepared_latents, noise_pred};
-      noise_pred.reset();
-      prev_latents = torch::Tensor();
 
       if (latents.has_value() &&
           prepared_latents.dtype() != latents.value().dtype()) {
         prepared_latents = prepared_latents.to(latents.value().dtype());
       }
-      if (i == timesteps.numel() - 1) {
-        LOG(INFO) << "[LongCatImage] Last step " << i
-                  << ": prepared_latents min/max after scheduler: "
-                  << prepared_latents.min().item<float>() << "/"
-                  << prepared_latents.max().item<float>();
-      }
     }
+
+    // Decode latents to images
     torch::Tensor image;
-    // Unpack latents
     torch::Tensor unpacked_latents =
         unpack_latents(prepared_latents, height, width, vae_scale_factor_);
-    LOG(INFO) << "[LongCatImage] After unpack_latents shape: "
-              << unpacked_latents.sizes();
-    LOG(INFO) << "[LongCatImage] After unpack_latents min/max: "
-              << unpacked_latents.min().item<float>() << "/"
-              << unpacked_latents.max().item<float>();
-    LOG(INFO) << "[LongCatImage] vae_scaling_factor_=" << vae_scaling_factor_
-              << ", vae_shift_factor_=" << vae_shift_factor_;
     unpacked_latents =
         (unpacked_latents / vae_scaling_factor_) + vae_shift_factor_;
-    LOG(INFO) << "[LongCatImage] After scaling/shifting shape: "
-              << unpacked_latents.sizes();
-    LOG(INFO) << "[LongCatImage] After scaling/shifting min/max: "
-              << unpacked_latents.min().item<float>() << "/"
-              << unpacked_latents.max().item<float>();
     unpacked_latents = unpacked_latents.to(options_.dtype());
-    LOG(INFO) << "[LongCatImage] After dtype conversion min/max: "
-              << unpacked_latents.min().item<float>() << "/"
-              << unpacked_latents.max().item<float>();
     image = vae_->decode(unpacked_latents);
-    LOG(INFO) << "[LongCatImage] After VAE decode shape: " << image.sizes();
-    LOG(INFO) << "[LongCatImage] After VAE decode min/max: "
-              << image.min().item<float>() << "/" << image.max().item<float>();
-
-    // postprocess will denormalize VAE output from [-1, 1] to [0, 1]
     image = vae_image_processor_->postprocess(image);
-    LOG(INFO) << "[LongCatImage] After postprocess shape: " << image.sizes();
-    LOG(INFO) << "[LongCatImage] After postprocess min/max: "
-              << image.min().item<float>() << "/" << image.max().item<float>();
-
-    LOG(INFO) << "[LongCatImage] Generated image tensor shape: "
-              << image.sizes();
-    LOG(INFO) << "[LongCatImage] Image tensor min/max: "
-              << image.min().item<float>() << "/" << image.max().item<float>();
     return std::vector<torch::Tensor>{{image}};
   }
 };
