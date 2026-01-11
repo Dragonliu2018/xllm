@@ -151,6 +151,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     vae_shift_factor_ = model_args.shift_factor();
     vae_scaling_factor_ = model_args.scale_factor();
+    LOG(INFO) << "[LongCatImage] VAE parameters - scaling_factor: "
+              << vae_scaling_factor_ << ", shift_factor: " << vae_shift_factor_
+              << ", scale_factor: " << vae_scale_factor_;
     tokenizer_max_length_ =
         context.get_model_args("text_encoder").max_position_embeddings();
     LOG(INFO) << "Initializing LongCat-Image pipeline...";
@@ -446,14 +449,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     int64_t batch_size = latents.size(0);
     int64_t num_patches = latents.size(1);
     int64_t channels = latents.size(2);
+
+    // Match Python implementation exactly: use integer division
     height = 2 * (height / (vae_scale_factor * 2));
     width = 2 * (width / (vae_scale_factor * 2));
+
+    LOG(INFO) << "[LongCatImage] unpack_latents input shape: "
+              << latents.sizes() << ", target height: " << height
+              << ", width: " << width
+              << ", vae_scale_factor: " << vae_scale_factor;
 
     torch::Tensor latents_unpacked =
         latents.view({batch_size, height / 2, width / 2, channels / 4, 2, 2});
     latents_unpacked = latents_unpacked.permute({0, 3, 1, 4, 2, 5});
     latents_unpacked = latents_unpacked.reshape(
         {batch_size, channels / (2 * 2), height, width});
+
+    LOG(INFO) << "[LongCatImage] unpack_latents output shape: "
+              << latents_unpacked.sizes();
 
     return latents_unpacked;
   }
@@ -633,6 +646,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     prompt_embeds = prompt_embeds.view(
         {batch_size * num_images_per_prompt, max_sequence_length, -1});
 
+    LOG(INFO) << "[LongCatImage] encode_prompt_qwen result shape: "
+              << prompt_embeds.sizes();
+    LOG(INFO) << "[LongCatImage] encode_prompt_qwen min: "
+              << prompt_embeds.min().item<float>()
+              << ", max: " << prompt_embeds.max().item<float>()
+              << ", mean: " << prompt_embeds.mean().item<float>()
+              << ", std: " << prompt_embeds.std().item<float>();
+
     return prompt_embeds.to(options_);
   }
 
@@ -656,6 +677,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
     int64_t seq_len = prompt_embeds.value().size(1);
     torch::Tensor text_ids = prepare_text_ids(seq_len);
+
+    LOG(INFO) << "[LongCatImage] encode_prompt result shape: "
+              << prompt_embeds.value().sizes();
+    LOG(INFO) << "[LongCatImage] encode_prompt min: "
+              << prompt_embeds.value().min().item<float>()
+              << ", max: " << prompt_embeds.value().max().item<float>()
+              << ", mean: " << prompt_embeds.value().mean().item<float>()
+              << ", std: " << prompt_embeds.value().std().item<float>();
 
     return {prompt_embeds.value(), text_ids};
   }
@@ -714,9 +743,27 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     }
     int64_t total_batch_size = batch_size * num_images_per_prompt;
 
-    bool do_classifier_free_guidance =
-        (guidance_scale > 1.0f) &&
-        (negative_prompt.has_value() || negative_prompt_embeds.has_value());
+    LOG(INFO) << "[LongCatImage] CFG debug - guidance_scale: " << guidance_scale
+              << ", guidance_scale > 1.0f: " << (guidance_scale > 1.0f)
+              << ", negative_prompt.has_value(): "
+              << negative_prompt.has_value()
+              << ", negative_prompt_embeds.has_value(): "
+              << negative_prompt_embeds.has_value();
+
+    // Enable CFG when guidance_scale > 1.0, regardless of negative_prompt
+    // availability If no negative_prompt is provided, we'll use an empty string
+    bool do_classifier_free_guidance = (guidance_scale > 1.0f);
+
+    // If CFG is enabled but no negative_prompt provided, use empty string
+    if (do_classifier_free_guidance && !negative_prompt.has_value() &&
+        !negative_prompt_embeds.has_value()) {
+      LOG(INFO) << "[LongCatImage] CFG enabled but no negative_prompt "
+                   "provided, using empty string";
+      negative_prompt = std::vector<std::string>{""};
+    }
+
+    LOG(INFO) << "[LongCatImage] CFG config - do_classifier_free_guidance: "
+              << do_classifier_free_guidance;
 
     // Encode prompt
     auto [encoded_prompt_embeds, text_ids] = encode_prompt(
@@ -744,6 +791,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                         seed.has_value() ? seed.value() : 42,
                         latents);
 
+    LOG(INFO) << "[LongCatImage] prepared_latents shape: "
+              << prepared_latents.sizes();
+    LOG(INFO) << "[LongCatImage] prepared_latents min: "
+              << prepared_latents.min().item<float>()
+              << ", max: " << prepared_latents.max().item<float>()
+              << ", mean: " << prepared_latents.mean().item<float>()
+              << ", std: " << prepared_latents.std().item<float>();
+
     // Prepare timesteps
     std::vector<float> new_sigmas;
     for (int64_t i = 0; i < num_inference_steps; ++i) {
@@ -760,6 +815,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                scheduler_->max_shift());
     auto [timesteps, num_inference_steps_actual] = retrieve_timesteps(
         scheduler_, num_inference_steps, options_.device(), new_sigmas, mu);
+
+    LOG(INFO) << "[LongCatImage] timesteps shape: " << timesteps.sizes();
+    LOG(INFO) << "[LongCatImage] timesteps values: ["
+              << timesteps[0].item<float>() << ", "
+              << timesteps[1].item<float>() << ", ..., "
+              << timesteps[-1].item<float>() << "]";
 
     scheduler_->set_begin_index(0);
     torch::Tensor timestep =
@@ -785,6 +846,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
       torch::Tensor noise_pred = transformer_->forward(
           prepared_latents, encoded_prompt_embeds, timestep, image_rotary_emb);
 
+      LOG(INFO) << "[LongCatImage] Step " << i << "/" << timesteps.numel()
+                << " - noise_pred shape: " << noise_pred.sizes();
+      LOG(INFO) << "[LongCatImage] Step " << i
+                << " - noise_pred min: " << noise_pred.min().item<float>()
+                << ", max: " << noise_pred.max().item<float>()
+                << ", mean: " << noise_pred.mean().item<float>()
+                << ", std: " << noise_pred.std().item<float>();
+
       if (do_classifier_free_guidance) {
         // Forward negative prompt
         torch::Tensor negative_noise_pred =
@@ -797,8 +866,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         torch::Tensor noise_pred_text = noise_pred;
 
         // Classifier-free guidance
+        torch::Tensor cfg_noise_pred_before = noise_pred;
         noise_pred = negative_noise_pred +
                      guidance_scale * (noise_pred_text - negative_noise_pred);
+
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << " - CFG applied, guidance_scale: " << guidance_scale;
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << " - noise_pred after CFG min: "
+                  << noise_pred.min().item<float>()
+                  << ", max: " << noise_pred.max().item<float>()
+                  << ", mean: " << noise_pred.mean().item<float>();
 
         // CFG renorm
         if (enable_cfg_renorm) {
@@ -808,12 +886,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                     .clamp_min(cfg_renorm_min)
                                     .clamp_max(1.0f);
           noise_pred = noise_pred * scale;
+
+          LOG(INFO) << "[LongCatImage] Step " << i
+                    << " - CFG renorm applied, scale min: "
+                    << scale.min().item<float>()
+                    << ", max: " << scale.max().item<float>();
         }
       }
 
       // Scheduler step
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
       prepared_latents = prev_latents.detach();
+
+      LOG(INFO) << "[LongCatImage] Step " << i
+                << " - after scheduler step, latents min: "
+                << prepared_latents.min().item<float>()
+                << ", max: " << prepared_latents.max().item<float>()
+                << ", mean: " << prepared_latents.mean().item<float>()
+                << ", std: " << prepared_latents.std().item<float>();
 
       if (latents.has_value() &&
           prepared_latents.dtype() != latents.value().dtype()) {
@@ -825,11 +915,81 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     torch::Tensor image;
     torch::Tensor unpacked_latents =
         unpack_latents(prepared_latents, height, width, vae_scale_factor_);
+
+    LOG(INFO) << "[LongCatImage] unpacked_latents shape: "
+              << unpacked_latents.sizes();
+    LOG(INFO) << "[LongCatImage] unpacked_latents min: "
+              << unpacked_latents.min().item<float>()
+              << ", max: " << unpacked_latents.max().item<float>()
+              << ", mean: " << unpacked_latents.mean().item<float>()
+              << ", std: " << unpacked_latents.std().item<float>();
+
     unpacked_latents =
         (unpacked_latents / vae_scaling_factor_) + vae_shift_factor_;
+
+    LOG(INFO) << "[LongCatImage] after VAE scaling/shift, latents min: "
+              << unpacked_latents.min().item<float>()
+              << ", max: " << unpacked_latents.max().item<float>()
+              << ", mean: " << unpacked_latents.mean().item<float>();
+
+    // Ensure VAE input matches model dtype (VAE is loaded in bfloat16)
     unpacked_latents = unpacked_latents.to(options_.dtype());
-    image = vae_->decode(unpacked_latents);
+
+    LOG(INFO) << "[LongCatImage] VAE input latents min: "
+              << unpacked_latents.min().item<float>()
+              << ", max: " << unpacked_latents.max().item<float>()
+              << ", mean: " << unpacked_latents.mean().item<float>()
+              << ", std: " << unpacked_latents.std().item<float>();
+
+    LOG(INFO) << "[LongCatImage] Calling VAE decode with input shape: "
+              << unpacked_latents.sizes();
+    if (!vae_) {
+      LOG(ERROR) << "[LongCatImage] VAE is null!";
+      return std::vector<torch::Tensor>{
+          {torch::zeros({1, 3, height, width}, options_)}};
+    }
+
+    try {
+      image = vae_->decode(unpacked_latents);
+      LOG(INFO) << "[LongCatImage] VAE decode completed, output shape: "
+                << image.sizes();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "[LongCatImage] VAE decode failed with exception: "
+                 << e.what();
+      return std::vector<torch::Tensor>{
+          {torch::zeros({1, 3, height, width}, options_)}};
+    } catch (...) {
+      LOG(ERROR) << "[LongCatImage] VAE decode failed with unknown exception";
+      return std::vector<torch::Tensor>{
+          {torch::zeros({1, 3, height, width}, options_)}};
+    }
+
+    LOG(INFO) << "[LongCatImage] VAE decoded image shape: " << image.sizes();
+    LOG(INFO) << "[LongCatImage] VAE decoded image min: "
+              << image.min().item<float>()
+              << ", max: " << image.max().item<float>()
+              << ", mean: " << image.mean().item<float>()
+              << ", std: " << image.std().item<float>();
+
     image = vae_image_processor_->postprocess(image);
+
+    LOG(INFO) << "[LongCatImage] After VAE postprocess min: "
+              << image.min().item<float>()
+              << ", max: " << image.max().item<float>()
+              << ", mean: " << image.mean().item<float>()
+              << ", std: " << image.std().item<float>();
+
+    LOG(INFO) << "[LongCatImage] Final image shape: " << image.sizes();
+    LOG(INFO) << "[LongCatImage] Final image min: " << image.min().item<float>()
+              << ", max: " << image.max().item<float>()
+              << ", mean: " << image.mean().item<float>();
+
+    // Ensure image is on CPU and in float32 format for encoding
+    image = image.cpu().to(torch::kFloat32).contiguous();
+
+    LOG(INFO) << "[LongCatImage] Final image device: " << image.device()
+              << ", dtype: " << image.dtype();
+
     return std::vector<torch::Tensor>{{image}};
   }
 };
