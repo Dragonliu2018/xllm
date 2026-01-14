@@ -47,16 +47,53 @@ bool OpenCVImageEncoder::encode(const torch::Tensor& t, std::string& raw_data) {
   auto img = t.permute({1, 2, 0}).contiguous();
   cv::Mat mat(img.size(0), img.size(1), CV_32FC3, img.data_ptr<float>());
 
+  // Log before conversion
+  LOG(INFO) << "[OpenCVEncoder] Input tensor shape: " << t.sizes()
+            << ", permuted shape: " << img.sizes() << ", Mat size: " << mat.rows
+            << "x" << mat.cols << ", Mat type: " << mat.type();
+
   cv::Mat mat_8u;
   mat.convertTo(mat_8u, CV_8UC3, 255.0);
 
-  // rgb -> bgr
+  // Log sample pixel values (RGB format, before BGR conversion)
+  cv::Vec3b sample_pixel_rgb = mat_8u.at<cv::Vec3b>(0, 0);
+  LOG(INFO) << "[OpenCVEncoder] Sample pixel (0,0) RGB values (before BGR "
+               "conversion): "
+            << "R=" << (int)sample_pixel_rgb[0]
+            << ", G=" << (int)sample_pixel_rgb[1]
+            << ", B=" << (int)sample_pixel_rgb[2];
+
+  // OpenCV's imencode expects BGR format (consistent with imdecode which
+  // returns BGR) imencode will convert BGR to RGB when encoding to PNG format
   cv::cvtColor(mat_8u, mat_8u, cv::COLOR_RGB2BGR);
+
+  // Log sample pixel values after BGR conversion
+  cv::Vec3b sample_pixel_bgr = mat_8u.at<cv::Vec3b>(0, 0);
+  LOG(INFO) << "[OpenCVEncoder] Sample pixel (0,0) BGR values (after BGR "
+               "conversion): "
+            << "B=" << (int)sample_pixel_bgr[0]
+            << ", G=" << (int)sample_pixel_bgr[1]
+            << ", R=" << (int)sample_pixel_bgr[2];
 
   std::vector<uchar> data;
   if (!cv::imencode(".png", mat_8u, data)) {
-    LOG(ERROR) << "image encode faild";
+    LOG(ERROR) << "[OpenCVEncoder] image encode failed";
     return false;
+  }
+
+  LOG(INFO) << "[OpenCVEncoder] Successfully encoded PNG, size: " << data.size()
+            << " bytes";
+
+  // Verify the encoded PNG by decoding it back and checking pixel values
+  cv::Mat decoded_test = cv::imdecode(cv::Mat(data), cv::IMREAD_COLOR);
+  if (!decoded_test.empty()) {
+    cv::cvtColor(decoded_test, decoded_test, cv::COLOR_BGR2RGB);
+    cv::Vec3b decoded_pixel = decoded_test.at<cv::Vec3b>(0, 0);
+    LOG(INFO) << "[OpenCVEncoder] Verification - Decoded PNG pixel (0,0) RGB: "
+              << "R=" << (int)decoded_pixel[0]
+              << ", G=" << (int)decoded_pixel[1]
+              << ", B=" << (int)decoded_pixel[2]
+              << " (should match input R=144, G=160, B=189)";
   }
 
   raw_data.assign(data.begin(), data.end());

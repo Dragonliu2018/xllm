@@ -136,6 +136,12 @@ torch::Tensor prepare_latent_image_ids(int64_t height,
   torch::Tensor width_range = torch::arange(width, options).unsqueeze(0);
   latent_image_ids.select(2, 2) += width_range + start_w;
   latent_image_ids = latent_image_ids.view({height * width, 3});
+
+  // Log position IDs for verification
+  LOG(INFO) << "[LongCatImage] Image position IDs (global) - start_h: "
+            << start_h << ", start_w: " << start_w << ", first few IDs: "
+            << latent_image_ids.slice(0, 0, std::min(3L, height * width));
+
   return latent_image_ids;
 }
 
@@ -156,6 +162,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
               << ", scale_factor: " << vae_scale_factor_;
     tokenizer_max_length_ =
         context.get_model_args("text_encoder").max_position_embeddings();
+    LOG(INFO) << "[LongCatImage] tokenizer_max_length_ (from "
+                 "max_position_embeddings): "
+              << tokenizer_max_length_
+              << ", but image position IDs will use hardcoded 512 (matching "
+                 "Python diffusers)";
     LOG(INFO) << "Initializing LongCat-Image pipeline...";
     vae_image_processor_ = VAEImageProcessor(
         ModelContext(context.get_parallel_args(),
@@ -403,28 +414,52 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   torch::Tensor prepare_text_ids(int64_t num_tokens,
                                  int64_t start_height = 0,
                                  int64_t start_width = 0) {
+    LOG(INFO) << "[LongCatImage] prepare_text_ids - num_tokens: " << num_tokens
+              << ", start_height: " << start_height
+              << ", start_width: " << start_width;
     torch::Tensor text_ids = torch::zeros({num_tokens, 3}, options_);
     // modality_id = 0 for text
     text_ids.select(1, 0).fill_(0);
     // position indices
+    // torch::arange(n) generates [0, 1, 2, ..., n-1]
     torch::Tensor token_range = torch::arange(num_tokens, options_);
+    LOG(INFO) << "[LongCatImage] prepare_text_ids - token_range shape: "
+              << token_range.sizes() << ", first few: "
+              << token_range.slice(0, 0, std::min(5L, num_tokens))
+              << ", last few: "
+              << token_range.slice(0, std::max(0L, num_tokens - 3), num_tokens);
     text_ids.select(1, 1) = token_range + start_height;
     text_ids.select(1, 2) = token_range + start_width;
     return text_ids;
   }
 
   // Prepare image position IDs for latent image tokens
+  // FIXED: Position IDs should start from 512 (hardcoded tokenizer_max_length)
+  // to avoid overlapping with text position IDs
+  // Note: Python diffusers uses hardcoded 512, not max_position_embeddings()
   torch::Tensor prepare_latent_image_ids(int64_t batch_size,
                                          int64_t height,
                                          int64_t width) {
     torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options_);
     // modality_id = 1 for image
     latent_image_ids.select(2, 0).fill_(1);
+
+    // FIXED: Start position from 512 (hardcoded, matching Python diffusers)
+    // Python: self.tokenizer_max_length = 512 (hardcoded, not from
+    // max_position_embeddings)
+    constexpr int64_t TOKENIZER_MAX_LENGTH = 512;
+    int64_t start_offset = TOKENIZER_MAX_LENGTH;
     torch::Tensor height_range = torch::arange(height, options_).unsqueeze(1);
-    latent_image_ids.select(2, 1) += height_range;
+    latent_image_ids.select(2, 1) += height_range + start_offset;
     torch::Tensor width_range = torch::arange(width, options_).unsqueeze(0);
-    latent_image_ids.select(2, 2) += width_range;
+    latent_image_ids.select(2, 2) += width_range + start_offset;
     latent_image_ids = latent_image_ids.view({height * width, 3});
+
+    // Log position IDs for verification
+    LOG(INFO) << "[LongCatImage] Image position IDs - start_offset: "
+              << start_offset << ", first few IDs: "
+              << latent_image_ids.slice(0, 0, std::min(3L, height * width));
+
     return latent_image_ids;
   }
 
@@ -627,15 +662,46 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             .view({batch_size, total_seq_len})
             .to(options_.device());
 
-    // Step 5: Get embeddings from text encoder
-    // Note: get_input_embeddings returns input embeddings, not hidden states
-    // TODO: Need to implement full forward pass to get hidden states from
-    // transformer layers
+    // Step 5: Get hidden states from text encoder by calling full forward pass
+    // This is critical: we need the output from transformer layers, not just
+    // input embeddings
     ModelInputParams input_params;
-    torch::Tensor prompt_embeds =
-        text_encoder_->get_input_embeddings(input_ids, input_params);
 
-    // prompt_embeds shape: [batch_size, total_seq_len, hidden_size]
+    // Flatten input_ids for forward pass: [batch_size * total_seq_len]
+    torch::Tensor tokens_flat = input_ids.view({-1});
+
+    // Create positions tensor: [batch_size * total_seq_len]
+    // Each token's position in the sequence (0, 1, 2, ..., total_seq_len-1)
+    torch::TensorOptions pos_options = options_.dtype(torch::kInt64);
+    torch::Tensor positions_flat =
+        torch::arange(total_seq_len, pos_options).repeat(batch_size);
+
+    // Prepare empty kv_caches for forward pass
+    std::vector<KVCache> kv_caches;
+
+    // Call full forward pass to get hidden states from transformer layers
+    LOG(INFO) << "[LongCatImage] Calling text_encoder forward - tokens shape: "
+              << tokens_flat.sizes()
+              << ", positions shape: " << positions_flat.sizes()
+              << ", first few positions: "
+              << positions_flat.slice(0, 0, std::min(5L, total_seq_len));
+
+    torch::Tensor hidden_states_flat = text_encoder_->forward(
+        tokens_flat, positions_flat, kv_caches, input_params);
+
+    LOG(INFO) << "[LongCatImage] Text encoder forward output shape: "
+              << hidden_states_flat.sizes()
+              << ", min: " << hidden_states_flat.min().item<float>()
+              << ", max: " << hidden_states_flat.max().item<float>()
+              << ", mean: " << hidden_states_flat.mean().item<float>()
+              << ", std: " << hidden_states_flat.std().item<float>();
+
+    // Reshape hidden_states: [batch_size * total_seq_len, hidden_size] ->
+    // [batch_size, total_seq_len, hidden_size]
+    int64_t hidden_size = hidden_states_flat.size(-1);
+    torch::Tensor prompt_embeds =
+        hidden_states_flat.view({batch_size, total_seq_len, hidden_size});
+
     // Remove prefix and suffix tokens
     prompt_embeds =
         prompt_embeds.slice(1, prefix_len, total_seq_len - suffix_len);
@@ -676,7 +742,15 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     }
 
     int64_t seq_len = prompt_embeds.value().size(1);
+    LOG(INFO) << "[LongCatImage] encode_prompt - seq_len: " << seq_len
+              << ", prompt_embeds shape: " << prompt_embeds.value().sizes();
     torch::Tensor text_ids = prepare_text_ids(seq_len);
+
+    LOG(INFO) << "[LongCatImage] Text position IDs - shape: "
+              << text_ids.sizes() << ", first few IDs: "
+              << text_ids.slice(0, 0, std::min(5L, seq_len))
+              << ", last few IDs: "
+              << text_ids.slice(0, std::max(0L, seq_len - 3), seq_len);
 
     LOG(INFO) << "[LongCatImage] encode_prompt result shape: "
               << prompt_embeds.value().sizes();
@@ -827,6 +901,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         torch::empty({prepared_latents.size(0)}, prepared_latents.options());
 
     // Image rotary positional embeddings
+    LOG(INFO) << "[LongCatImage] Before forward_cache - text_ids shape: "
+              << text_ids.sizes()
+              << ", latent_image_ids shape: " << latent_image_ids.sizes();
+    LOG(INFO) << "[LongCatImage] text_ids last few: "
+              << text_ids.slice(
+                     0, std::max(0L, text_ids.size(0) - 3), text_ids.size(0));
+    LOG(INFO) << "[LongCatImage] latent_image_ids first few: "
+              << latent_image_ids.slice(
+                     0, 0, std::min(3L, latent_image_ids.size(0)));
+
     auto [rot_emb1, rot_emb2] =
         pos_embed_->forward_cache(text_ids,
                                   latent_image_ids,
@@ -836,6 +920,12 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     torch::Tensor image_rotary_emb = torch::stack(rot_embs, 0);
 
     // Denoising loop
+    LOG(INFO)
+        << "[LongCatImage] Before denoising loop - prepared_latents shape: "
+        << prepared_latents.sizes()
+        << ", encoded_prompt_embeds shape: " << encoded_prompt_embeds.sizes()
+        << ", image_rotary_emb shape: " << image_rotary_emb.sizes();
+
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i].unsqueeze(0);
       timestep.fill_(t.item<float>())
@@ -843,6 +933,14 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           .div_(1000.0f);
 
       // Forward through transformer
+      if (i == 0) {
+        LOG(INFO)
+            << "[LongCatImage] Step 0 - Transformer inputs - latents shape: "
+            << prepared_latents.sizes()
+            << ", prompt_embeds shape: " << encoded_prompt_embeds.sizes()
+            << ", timestep: " << timestep.item<float>()
+            << ", rotary_emb shape: " << image_rotary_emb.sizes();
+      }
       torch::Tensor noise_pred = transformer_->forward(
           prepared_latents, encoded_prompt_embeds, timestep, image_rotary_emb);
 
