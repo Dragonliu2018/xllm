@@ -417,19 +417,59 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     LOG(INFO) << "[LongCatImage] prepare_text_ids - num_tokens: " << num_tokens
               << ", start_height: " << start_height
               << ", start_width: " << start_width;
-    torch::Tensor text_ids = torch::zeros({num_tokens, 3}, options_);
+
+    // Create position IDs with correct integer values first
+    // Use int64 to ensure precision, then convert to target dtype
+    torch::TensorOptions int_options =
+        options_.dtype(torch::kInt64).device(options_.device());
+    torch::Tensor text_ids_int = torch::zeros({num_tokens, 3}, int_options);
+
     // modality_id = 0 for text
-    text_ids.select(1, 0).fill_(0);
-    // position indices
-    // torch::arange(n) generates [0, 1, 2, ..., n-1]
-    torch::Tensor token_range = torch::arange(num_tokens, options_);
+    text_ids_int.select(1, 0).fill_(0);
+
+    // position indices: [0, 1, 2, ..., num_tokens-1]
+    torch::Tensor token_range = torch::arange(num_tokens, int_options);
+    text_ids_int.select(1, 1) = token_range + start_height;
+    text_ids_int.select(1, 2) = token_range + start_width;
+
+    // Verify integer values before conversion
     LOG(INFO) << "[LongCatImage] prepare_text_ids - token_range shape: "
-              << token_range.sizes() << ", first few: "
+              << token_range.sizes() << ", dtype: " << token_range.dtype()
+              << ", first few: "
               << token_range.slice(0, 0, std::min(5L, num_tokens))
               << ", last few: "
-              << token_range.slice(0, std::max(0L, num_tokens - 3), num_tokens);
-    text_ids.select(1, 1) = token_range + start_height;
-    text_ids.select(1, 2) = token_range + start_width;
+              << token_range.slice(0, std::max(0L, num_tokens - 3), num_tokens)
+              << ", min: " << token_range.min().item<int64_t>()
+              << ", max: " << token_range.max().item<int64_t>();
+
+    auto last_pos_h_int =
+        text_ids_int.select(1, 1).index({num_tokens - 1}).item<int64_t>();
+    auto last_pos_w_int =
+        text_ids_int.select(1, 2).index({num_tokens - 1}).item<int64_t>();
+    LOG(INFO) << "[LongCatImage] prepare_text_ids - last position ID (int64): ("
+              << last_pos_h_int << ", " << last_pos_w_int << "), expected: ("
+              << (num_tokens - 1 + start_height) << ", "
+              << (num_tokens - 1 + start_width) << ")";
+
+    // CRITICAL FIX: Convert to float32 instead of options_.dtype() to avoid
+    // precision loss bfloat16 cannot accurately represent 511, causing it to
+    // round to 512 Since LongCatImagePosEmbed::forward() converts position IDs
+    // to float32 anyway, we should use float32 directly to preserve precision
+    torch::TensorOptions float32_options =
+        options_.dtype(torch::kFloat32).device(options_.device());
+    torch::Tensor text_ids = text_ids_int.to(float32_options);
+
+    // Verify after conversion (read as float to check precision)
+    auto last_pos_h =
+        text_ids.select(1, 1).index({num_tokens - 1}).item<float>();
+    auto last_pos_w =
+        text_ids.select(1, 2).index({num_tokens - 1}).item<float>();
+    LOG(INFO) << "[LongCatImage] prepare_text_ids - last position ID (after "
+                 "conversion to float32): ("
+              << last_pos_h << ", " << last_pos_w << "), expected: ("
+              << (num_tokens - 1 + start_height) << ", "
+              << (num_tokens - 1 + start_width) << ")";
+
     return text_ids;
   }
 
@@ -440,24 +480,62 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   torch::Tensor prepare_latent_image_ids(int64_t batch_size,
                                          int64_t height,
                                          int64_t width) {
-    torch::Tensor latent_image_ids = torch::zeros({height, width, 3}, options_);
-    // modality_id = 1 for image
-    latent_image_ids.select(2, 0).fill_(1);
-
-    // FIXED: Start position from 512 (hardcoded, matching Python diffusers)
-    // Python: self.tokenizer_max_length = 512 (hardcoded, not from
-    // max_position_embeddings)
+    // CRITICAL FIX: Due to bfloat16 precision, text position ID 511 may be
+    // rounded to 512 To avoid overlap, we start image position IDs from 513
+    // instead of 512 This ensures text IDs [0-511] (may appear as [0-512] in
+    // bfloat16) don't overlap with image IDs
     constexpr int64_t TOKENIZER_MAX_LENGTH = 512;
-    int64_t start_offset = TOKENIZER_MAX_LENGTH;
-    torch::Tensor height_range = torch::arange(height, options_).unsqueeze(1);
-    latent_image_ids.select(2, 1) += height_range + start_offset;
-    torch::Tensor width_range = torch::arange(width, options_).unsqueeze(0);
-    latent_image_ids.select(2, 2) += width_range + start_offset;
+    // Start from 513 to avoid overlap with text position 512 (which is actually
+    // 511 rounded)
+    int64_t start_offset = TOKENIZER_MAX_LENGTH + 1;  // 513 instead of 512
+
+    // Create position IDs with correct integer values first (int64), then
+    // convert to target dtype This avoids precision loss when adding
+    // start_offset
+    torch::TensorOptions int_options =
+        options_.dtype(torch::kInt64).device(options_.device());
+    torch::Tensor latent_image_ids_int =
+        torch::zeros({height, width, 3}, int_options);
+
+    // modality_id = 1 for image
+    latent_image_ids_int.select(2, 0).fill_(1);
+
+    // Create ranges in int64, add offset, then convert
+    torch::Tensor height_range_int =
+        torch::arange(height, int_options).unsqueeze(1);
+    torch::Tensor width_range_int =
+        torch::arange(width, int_options).unsqueeze(0);
+
+    latent_image_ids_int.select(2, 1) += height_range_int + start_offset;
+    latent_image_ids_int.select(2, 2) += width_range_int + start_offset;
+
+    // Verify integer values before conversion
+    auto first_pos_h_int =
+        latent_image_ids_int.select(2, 1).index({0, 0}).item<int64_t>();
+    auto first_pos_w_int =
+        latent_image_ids_int.select(2, 2).index({0, 0}).item<int64_t>();
+    LOG(INFO) << "[LongCatImage] Image position IDs (int64) - start_offset: "
+              << start_offset << ", first position ID (int64): ("
+              << first_pos_h_int << ", " << first_pos_w_int << "), expected: ("
+              << start_offset << ", " << start_offset << ")";
+
+    // CRITICAL FIX: Convert to float32 instead of options_.dtype() to avoid
+    // precision loss bfloat16 cannot accurately represent 513, causing it to
+    // round to 512 Since LongCatImagePosEmbed::forward() converts position IDs
+    // to float32 anyway, we should use float32 directly to preserve precision
+    torch::TensorOptions float32_options =
+        options_.dtype(torch::kFloat32).device(options_.device());
+    torch::Tensor latent_image_ids = latent_image_ids_int.to(float32_options);
     latent_image_ids = latent_image_ids.view({height * width, 3});
 
-    // Log position IDs for verification
-    LOG(INFO) << "[LongCatImage] Image position IDs - start_offset: "
-              << start_offset << ", first few IDs: "
+    // Verify after conversion
+    auto first_pos_h = latent_image_ids.select(1, 1).index({0}).item<float>();
+    auto first_pos_w = latent_image_ids.select(1, 2).index({0}).item<float>();
+    LOG(INFO) << "[LongCatImage] Image position IDs (after conversion to "
+                 "float32) - first position ID: ("
+              << first_pos_h << ", " << first_pos_w << "), expected: ("
+              << start_offset << ", " << start_offset << ")";
+    LOG(INFO) << "[LongCatImage] Image position IDs - first few IDs: "
               << latent_image_ids.slice(0, 0, std::min(3L, height * width));
 
     return latent_image_ids;
@@ -679,7 +757,24 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // Prepare empty kv_caches for forward pass
     std::vector<KVCache> kv_caches;
 
+    // For comparison: get input embeddings (before transformer layers)
+    // Note: get_input_embeddings requires input_ids (not flattened) and
+    // ModelInputParams
+    torch::Tensor input_embeddings =
+        text_encoder_->get_input_embeddings(input_ids, input_params);
+    // Reshape to match flattened format for comparison
+    input_embeddings = input_embeddings.view({-1, input_embeddings.size(-1)});
+    LOG(INFO)
+        << "[LongCatImage] Input embeddings (before transformer) - shape: "
+        << input_embeddings.sizes()
+        << ", min: " << input_embeddings.min().item<float>()
+        << ", max: " << input_embeddings.max().item<float>()
+        << ", mean: " << input_embeddings.mean().item<float>()
+        << ", std: " << input_embeddings.std().item<float>();
+
     // Call full forward pass to get hidden states from transformer layers
+    // This should return the output from the last transformer layer (after all
+    // 28 layers)
     LOG(INFO) << "[LongCatImage] Calling text_encoder forward - tokens shape: "
               << tokens_flat.sizes()
               << ", positions shape: " << positions_flat.sizes()
@@ -689,12 +784,26 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     torch::Tensor hidden_states_flat = text_encoder_->forward(
         tokens_flat, positions_flat, kv_caches, input_params);
 
-    LOG(INFO) << "[LongCatImage] Text encoder forward output shape: "
+    LOG(INFO) << "[LongCatImage] Text encoder forward output (after all "
+                 "transformer layers) - shape: "
               << hidden_states_flat.sizes()
               << ", min: " << hidden_states_flat.min().item<float>()
               << ", max: " << hidden_states_flat.max().item<float>()
               << ", mean: " << hidden_states_flat.mean().item<float>()
               << ", std: " << hidden_states_flat.std().item<float>();
+
+    // Verify that forward output is different from input embeddings
+    // (If they're the same, it means forward() is not actually going through
+    // transformer layers)
+    auto embedding_mean = input_embeddings.mean().item<float>();
+    auto forward_mean = hidden_states_flat.mean().item<float>();
+    auto embedding_std = input_embeddings.std().item<float>();
+    auto forward_std = hidden_states_flat.std().item<float>();
+    LOG(INFO)
+        << "[LongCatImage] Comparison - Embedding vs Forward output: "
+        << "mean_diff: " << std::abs(embedding_mean - forward_mean)
+        << ", std_diff: " << std::abs(embedding_std - forward_std)
+        << " (should be significantly different if forward() works correctly)";
 
     // Reshape hidden_states: [batch_size * total_seq_len, hidden_size] ->
     // [batch_size, total_seq_len, hidden_size]
