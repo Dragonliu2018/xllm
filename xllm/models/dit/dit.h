@@ -1838,6 +1838,23 @@ class LongCatImageTransformer2DModelImpl : public torch::nn::Module {
     return proj_out_(output_hidden);
   }
 
+  // Forward method with step_idx for cache separation (used for CFG)
+  // Note: LongCatImageTransformer2DModel doesn't use cache, so step_idx is
+  // ignored But we keep this signature for consistency and future cache support
+  torch::Tensor forward(const torch::Tensor& hidden_states_input,
+                        const torch::Tensor& encoder_hidden_states_input,
+                        const torch::Tensor& timestep,
+                        const torch::Tensor& image_rotary_emb,
+                        int64_t step_idx) {
+    // For LongCatImageTransformer2DModel, we don't use cache, so step_idx is
+    // ignored But we keep this signature for consistency with
+    // FluxTransformer2DModel
+    return forward(hidden_states_input,
+                   encoder_hidden_states_input,
+                   timestep,
+                   image_rotary_emb);
+  }
+
   void load_model(std::unique_ptr<DiTFolderLoader> loader) {
     for (const auto& state_dict : loader->get_state_dicts()) {
       context_embedder_->load_state_dict(

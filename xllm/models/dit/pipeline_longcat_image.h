@@ -678,6 +678,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         }
       }
 
+      // Log tokenization result for debugging
+      if (each_prompt.empty() || each_prompt == "") {
+        LOG(INFO) << "[LongCatImage] Empty prompt tokenized to "
+                  << all_tokens.size() << " tokens, first few: "
+                  << (all_tokens.empty()
+                          ? "[]"
+                          : (all_tokens.size() <= 5
+                                 ? std::to_string(all_tokens[0])
+                                 : std::to_string(all_tokens[0]) + ",..."));
+      }
+
       // Truncate if too long
       if (static_cast<int64_t>(all_tokens.size()) > max_sequence_length) {
         LOG(WARNING) << "Input truncated from " << all_tokens.size() << " to "
@@ -962,6 +973,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                               max_sequence_length);
       negative_encoded_embeds = neg_emb;
       negative_text_ids = neg_ids;
+
+      LOG(INFO) << "[LongCatImage] Negative prompt encoded - shape: "
+                << negative_encoded_embeds.sizes()
+                << ", min: " << negative_encoded_embeds.min().item<float>()
+                << ", max: " << negative_encoded_embeds.max().item<float>()
+                << ", mean: " << negative_encoded_embeds.mean().item<float>();
+      LOG(INFO) << "[LongCatImage] Positive prompt encoded - shape: "
+                << encoded_prompt_embeds.sizes()
+                << ", min: " << encoded_prompt_embeds.min().item<float>()
+                << ", max: " << encoded_prompt_embeds.max().item<float>()
+                << ", mean: " << encoded_prompt_embeds.mean().item<float>();
     }
 
     // Prepare latent variables
@@ -1063,14 +1085,28 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
       if (do_classifier_free_guidance) {
         // Forward negative prompt
-        torch::Tensor negative_noise_pred =
-            transformer_->forward(prepared_latents,
-                                  negative_encoded_embeds,
-                                  timestep,
-                                  image_rotary_emb);
+        // Use a different step_idx (i + 10000) to avoid cache collision
+        // This ensures positive and negative prompts use separate cache entries
+        torch::Tensor negative_noise_pred = transformer_->forward(
+            prepared_latents,
+            negative_encoded_embeds,
+            timestep,
+            image_rotary_emb,
+            i + 10000);  // Use different step_idx to avoid cache collision
 
         // Save conditional prediction before CFG
         torch::Tensor noise_pred_text = noise_pred;
+
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << " - Before CFG - noise_pred_text min: "
+                  << noise_pred_text.min().item<float>()
+                  << ", max: " << noise_pred_text.max().item<float>()
+                  << ", mean: " << noise_pred_text.mean().item<float>();
+        LOG(INFO) << "[LongCatImage] Step " << i
+                  << " - Before CFG - negative_noise_pred min: "
+                  << negative_noise_pred.min().item<float>()
+                  << ", max: " << negative_noise_pred.max().item<float>()
+                  << ", mean: " << negative_noise_pred.mean().item<float>();
 
         // Classifier-free guidance
         torch::Tensor cfg_noise_pred_before = noise_pred;
