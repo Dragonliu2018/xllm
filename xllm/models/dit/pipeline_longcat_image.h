@@ -795,37 +795,43 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     torch::Tensor hidden_states_flat = text_encoder_->forward(
         tokens_flat, positions_flat, kv_caches, input_params);
 
+    // Reshape hidden_states: [batch_size * total_seq_len, hidden_size] ->
+    // [batch_size, total_seq_len, hidden_size]
+    // This matches diffusers' output shape: [batch_size, total_seq_len,
+    // hidden_size]
+    int64_t hidden_size = hidden_states_flat.size(-1);
+    torch::Tensor hidden_states_last =
+        hidden_states_flat.view({batch_size, total_seq_len, hidden_size});
+
     LOG(INFO) << "[LongCatImage] Text encoder forward output (after all "
                  "transformer layers) - shape: "
-              << hidden_states_flat.sizes()
-              << ", min: " << hidden_states_flat.min().item<float>()
-              << ", max: " << hidden_states_flat.max().item<float>()
-              << ", mean: " << hidden_states_flat.mean().item<float>()
-              << ", std: " << hidden_states_flat.std().item<float>();
+              << hidden_states_last.sizes()
+              << ", min: " << hidden_states_last.min().item<float>()
+              << ", max: " << hidden_states_last.max().item<float>()
+              << ", mean: " << hidden_states_last.mean().item<float>()
+              << ", std: " << hidden_states_last.std().item<float>();
 
     // Verify that forward output is different from input embeddings
     // (If they're the same, it means forward() is not actually going through
     // transformer layers)
-    auto embedding_mean = input_embeddings.mean().item<float>();
-    auto forward_mean = hidden_states_flat.mean().item<float>();
-    auto embedding_std = input_embeddings.std().item<float>();
-    auto forward_std = hidden_states_flat.std().item<float>();
+    // Reshape input_embeddings to match hidden_states_last shape for comparison
+    torch::Tensor input_embeddings_reshaped =
+        input_embeddings.view({batch_size, total_seq_len, hidden_size});
+    auto embedding_mean = input_embeddings_reshaped.mean().item<float>();
+    auto forward_mean = hidden_states_last.mean().item<float>();
+    auto embedding_std = input_embeddings_reshaped.std().item<float>();
+    auto forward_std = hidden_states_last.std().item<float>();
     LOG(INFO)
         << "[LongCatImage] Comparison - Embedding vs Forward output: "
-        << "mean_diff: " << std::abs(embedding_mean - forward_mean)
-        << ", std_diff: " << std::abs(embedding_std - forward_std)
+        << "mean_diff: " << std::abs(forward_mean - embedding_mean)
+        << ", std_diff: " << std::abs(forward_std - embedding_std)
         << " (should be significantly different if forward() works correctly)";
 
-    // Reshape hidden_states: [batch_size * total_seq_len, hidden_size] ->
-    // [batch_size, total_seq_len, hidden_size]
-    int64_t hidden_size = hidden_states_flat.size(-1);
+    // Remove prefix and suffix tokens (same as diffusers: prompt_embeds[:,
+    // prefix_len:-suffix_len, :]) Now shape: [batch_size, max_sequence_length,
+    // hidden_size]
     torch::Tensor prompt_embeds =
-        hidden_states_flat.view({batch_size, total_seq_len, hidden_size});
-
-    // Remove prefix and suffix tokens
-    prompt_embeds =
-        prompt_embeds.slice(1, prefix_len, total_seq_len - suffix_len);
-    // Now shape: [batch_size, max_sequence_length, hidden_size]
+        hidden_states_last.slice(1, prefix_len, total_seq_len - suffix_len);
 
     // Step 6: Repeat for num_images_per_prompt
     prompt_embeds = prompt_embeds.repeat({1, num_images_per_prompt, 1});
