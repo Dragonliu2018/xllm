@@ -474,20 +474,17 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   }
 
   // Prepare image position IDs for latent image tokens
-  // FIXED: Position IDs should start from 512 (hardcoded tokenizer_max_length)
-  // to avoid overlapping with text position IDs
+  // Match diffusers: Position IDs should start from 512 (hardcoded
+  // tokenizer_max_length) to avoid overlapping with text position IDs
   // Note: Python diffusers uses hardcoded 512, not max_position_embeddings()
   torch::Tensor prepare_latent_image_ids(int64_t batch_size,
                                          int64_t height,
                                          int64_t width) {
-    // CRITICAL FIX: Due to bfloat16 precision, text position ID 511 may be
-    // rounded to 512 To avoid overlap, we start image position IDs from 513
-    // instead of 512 This ensures text IDs [0-511] (may appear as [0-512] in
-    // bfloat16) don't overlap with image IDs
+    // Match diffusers exactly: use 512 as start_offset
+    // This matches diffusers: start=(self.tokenizer_max_length,
+    // self.tokenizer_max_length) which is 512
     constexpr int64_t TOKENIZER_MAX_LENGTH = 512;
-    // Start from 513 to avoid overlap with text position 512 (which is actually
-    // 511 rounded)
-    int64_t start_offset = TOKENIZER_MAX_LENGTH + 1;  // 513 instead of 512
+    int64_t start_offset = TOKENIZER_MAX_LENGTH;  // 512, matching diffusers
 
     // Create position IDs with correct integer values first (int64), then
     // convert to target dtype This avoids precision loss when adding
@@ -771,10 +768,21 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // For comparison: get input embeddings (before transformer layers)
     // Note: get_input_embeddings requires input_ids (not flattened) and
     // ModelInputParams
+    // CRITICAL: Ensure input_ids dtype and shape match diffusers
+    // Diffusers uses input_ids with shape [batch_size, total_seq_len] and dtype
+    // int64
+    LOG(INFO) << "[LongCatImage] input_ids shape: " << input_ids.sizes()
+              << ", dtype: " << input_ids.dtype() << ", first few tokens: "
+              << input_ids.slice(0, 0, 1).slice(
+                     1, 0, std::min(10L, total_seq_len))
+              << ", last few tokens: "
+              << input_ids.slice(0, 0, 1).slice(
+                     1, std::max(0L, total_seq_len - 10), total_seq_len);
+
     torch::Tensor input_embeddings =
         text_encoder_->get_input_embeddings(input_ids, input_params);
-    // Reshape to match flattened format for comparison
-    input_embeddings = input_embeddings.view({-1, input_embeddings.size(-1)});
+    // Keep shape as [batch_size, total_seq_len, hidden_size] to match diffusers
+    // Don't flatten here - we'll flatten later if needed for comparison
     LOG(INFO)
         << "[LongCatImage] Input embeddings (before transformer) - shape: "
         << input_embeddings.sizes()
@@ -786,11 +794,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // Call full forward pass to get hidden states from transformer layers
     // This should return the output from the last transformer layer (after all
     // 28 layers)
+    // CRITICAL: Ensure tokens_flat matches input_ids exactly (just flattened)
+    // Diffusers doesn't flatten - it passes [batch_size, seq_len] directly
+    // But xllm's API requires flattened tokens, so we flatten input_ids
     LOG(INFO) << "[LongCatImage] Calling text_encoder forward - tokens shape: "
               << tokens_flat.sizes()
               << ", positions shape: " << positions_flat.sizes()
               << ", first few positions: "
-              << positions_flat.slice(0, 0, std::min(5L, total_seq_len));
+              << positions_flat.slice(0, 0, std::min(5L, total_seq_len))
+              << ", first few token_ids: "
+              << tokens_flat.slice(0, 0, std::min(10L, total_seq_len));
 
     torch::Tensor hidden_states_flat = text_encoder_->forward(
         tokens_flat, positions_flat, kv_caches, input_params);
@@ -814,12 +827,13 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // Verify that forward output is different from input embeddings
     // (If they're the same, it means forward() is not actually going through
     // transformer layers)
-    // Reshape input_embeddings to match hidden_states_last shape for comparison
-    torch::Tensor input_embeddings_reshaped =
-        input_embeddings.view({batch_size, total_seq_len, hidden_size});
-    auto embedding_mean = input_embeddings_reshaped.mean().item<float>();
+    // input_embeddings should already be [batch_size, total_seq_len,
+    // hidden_size] from get_input_embeddings, so we don't need to reshape
+    CHECK_EQ(input_embeddings.dim(), 3)
+        << "input_embeddings should be 3D [batch, seq, hidden]";
+    auto embedding_mean = input_embeddings.mean().item<float>();
     auto forward_mean = hidden_states_last.mean().item<float>();
-    auto embedding_std = input_embeddings_reshaped.std().item<float>();
+    auto embedding_std = input_embeddings.std().item<float>();
     auto forward_std = hidden_states_last.std().item<float>();
     LOG(INFO)
         << "[LongCatImage] Comparison - Embedding vs Forward output: "
