@@ -727,19 +727,38 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // Step 4: Concatenate prefix + tokens + suffix
     int64_t total_seq_len = prefix_len + max_sequence_length + suffix_len;
     std::vector<int32_t> input_ids_flat;
+    std::vector<int32_t> attention_mask_flat;
     input_ids_flat.reserve(batch_size * total_seq_len);
+    attention_mask_flat.reserve(batch_size * total_seq_len);
 
     for (int64_t i = 0; i < batch_size; ++i) {
       // Add prefix
       input_ids_flat.insert(
           input_ids_flat.end(), prefix_tokens.begin(), prefix_tokens.end());
+      attention_mask_flat.insert(attention_mask_flat.end(), prefix_len, 1);
+
       // Add tokens
       input_ids_flat.insert(input_ids_flat.end(),
                             batch_all_tokens[i].begin(),
                             batch_all_tokens[i].end());
+      // Count non-padding tokens for attention mask
+      int64_t non_pad_count = 0;
+      for (const auto& token : batch_all_tokens[i]) {
+        if (token != pad_token_id) {
+          non_pad_count++;
+        } else {
+          break;  // Padding starts here
+        }
+      }
+      // Mark real tokens as 1, padding as 0
+      for (int64_t j = 0; j < max_sequence_length; ++j) {
+        attention_mask_flat.push_back(j < non_pad_count ? 1 : 0);
+      }
+
       // Add suffix
       input_ids_flat.insert(
           input_ids_flat.end(), suffix_tokens.begin(), suffix_tokens.end());
+      attention_mask_flat.insert(attention_mask_flat.end(), suffix_len, 1);
     }
 
     // Create input_ids tensor [batch_size, total_seq_len]
@@ -748,12 +767,28 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
             .view({batch_size, total_seq_len})
             .to(options_.device());
 
-    // Step 5: Get hidden states from text encoder by calling full forward pass
-    // This is critical: we need the output from transformer layers, not just
-    // input embeddings
+    // Create attention_mask tensor [batch_size, total_seq_len]
+    torch::Tensor attention_mask =
+        torch::tensor(attention_mask_flat, torch::dtype(torch::kLong))
+            .view({batch_size, total_seq_len})
+            .to(options_.device());
+
+    LOG(INFO) << "[LongCatImage] attention_mask shape: "
+              << attention_mask.sizes() << ", dtype: " << attention_mask.dtype()
+              << ", first few values (first batch): "
+              << attention_mask.slice(0, 0, 1).slice(
+                     1, 0, std::min(20L, total_seq_len));
+
+    // Step 5: Get hidden states from text encoder
+    // Following diffusers implementation exactly
+    // The key is that attention_mask is used to create an additive mask for the
+    // attention mechanism This is applied INSIDE the transformer layers, not
+    // post-hoc
+
     ModelInputParams input_params;
 
-    // Flatten input_ids for forward pass: [batch_size * total_seq_len]
+    // Flatten input_ids for forward pass: [batch_size, total_seq_len] ->
+    // [batch_size * total_seq_len]
     torch::Tensor tokens_flat = input_ids.view({-1});
 
     // Create positions tensor: [batch_size * total_seq_len]
@@ -765,96 +800,80 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     // Prepare empty kv_caches for forward pass
     std::vector<KVCache> kv_caches;
 
-    // For comparison: get input embeddings (before transformer layers)
-    // Note: get_input_embeddings requires input_ids (not flattened) and
-    // ModelInputParams
-    // CRITICAL: Ensure input_ids dtype and shape match diffusers
-    // Diffusers uses input_ids with shape [batch_size, total_seq_len] and dtype
-    // int64
-    LOG(INFO) << "[LongCatImage] input_ids shape: " << input_ids.sizes()
-              << ", dtype: " << input_ids.dtype() << ", first few tokens: "
-              << input_ids.slice(0, 0, 1).slice(
-                     1, 0, std::min(10L, total_seq_len))
-              << ", last few tokens: "
-              << input_ids.slice(0, 0, 1).slice(
-                     1, std::max(0L, total_seq_len - 10), total_seq_len);
+    LOG(INFO) << "[LongCatImage] ===== Starting Text Encoder Forward Pass ====="
+              << "\n[LongCatImage] input_ids shape: " << input_ids.sizes()
+              << ", dtype: " << input_ids.dtype()
+              << "\n[LongCatImage] attention_mask shape: "
+              << attention_mask.sizes() << ", dtype: " << attention_mask.dtype()
+              << "\n[LongCatImage] Prefix length: " << prefix_len
+              << ", Suffix length: " << suffix_len
+              << ", Total sequence length: " << total_seq_len;
 
-    torch::Tensor input_embeddings =
-        text_encoder_->get_input_embeddings(input_ids, input_params);
-    // Keep shape as [batch_size, total_seq_len, hidden_size] to match diffusers
-    // Don't flatten here - we'll flatten later if needed for comparison
-    LOG(INFO)
-        << "[LongCatImage] Input embeddings (before transformer) - shape: "
-        << input_embeddings.sizes()
-        << ", min: " << input_embeddings.min().item<float>()
-        << ", max: " << input_embeddings.max().item<float>()
-        << ", mean: " << input_embeddings.mean().item<float>()
-        << ", std: " << input_embeddings.std().item<float>();
+    // Print input parameters for forward_longcat call (for diffusers
+    // comparison)
+    LOG(INFO) << "[LongCatImage] ===== forward_longcat Input Parameters ====="
+              << "\n[LongCatImage] tokens_flat shape: " << tokens_flat.sizes()
+              << ", dtype: " << tokens_flat.dtype()
+              << ", device: " << tokens_flat.device()
+              << "\n[LongCatImage] tokens_flat values: " << tokens_flat
+              << "\n[LongCatImage] positions_flat shape: "
+              << positions_flat.sizes() << ", dtype: " << positions_flat.dtype()
+              << ", device: " << positions_flat.device()
+              << "\n[LongCatImage] positions_flat values: " << positions_flat
+              << "\n[LongCatImage] kv_caches size: " << kv_caches.size()
+              << "\n[LongCatImage] attention_mask shape: "
+              << attention_mask.sizes() << ", dtype: " << attention_mask.dtype()
+              << ", device: " << attention_mask.device()
+              << "\n[LongCatImage] attention_mask values: " << attention_mask;
 
-    // Call full forward pass to get hidden states from transformer layers
-    // This should return the output from the last transformer layer (after all
-    // 28 layers)
-    // CRITICAL: Ensure tokens_flat matches input_ids exactly (just flattened)
-    // Diffusers doesn't flatten - it passes [batch_size, seq_len] directly
-    // But xllm's API requires flattened tokens, so we flatten input_ids
-    LOG(INFO) << "[LongCatImage] Calling text_encoder forward - tokens shape: "
-              << tokens_flat.sizes()
-              << ", positions shape: " << positions_flat.sizes()
-              << ", first few positions: "
-              << positions_flat.slice(0, 0, std::min(5L, total_seq_len))
-              << ", first few token_ids: "
-              << tokens_flat.slice(0, 0, std::min(10L, total_seq_len));
+    // Call text encoder forward pass with attention_mask using the
+    // LongCat-specific method This ensures proper masking behavior matching
+    // diffusers exactly
+    torch::Tensor hidden_states_flat = text_encoder_->forward_longcat(
+        tokens_flat, positions_flat, kv_caches, input_params, attention_mask);
 
-    torch::Tensor hidden_states_flat = text_encoder_->forward(
-        tokens_flat, positions_flat, kv_caches, input_params);
-
-    // Reshape hidden_states: [batch_size * total_seq_len, hidden_size] ->
-    // [batch_size, total_seq_len, hidden_size]
-    // This matches diffusers' output shape: [batch_size, total_seq_len,
-    // hidden_size]
+    // Reshape: [batch_size * total_seq_len, hidden_size] -> [batch_size,
+    // total_seq_len, hidden_size]
     int64_t hidden_size = hidden_states_flat.size(-1);
     torch::Tensor hidden_states_last =
         hidden_states_flat.view({batch_size, total_seq_len, hidden_size});
 
-    LOG(INFO) << "[LongCatImage] Text encoder forward output (after all "
-                 "transformer layers) - shape: "
-              << hidden_states_last.sizes()
-              << ", min: " << hidden_states_last.min().item<float>()
+    LOG(INFO) << "[LongCatImage] Text encoder forward output - shape: "
+              << hidden_states_last.sizes() << "\n[LongCatImage] Stats: min: "
+              << hidden_states_last.min().item<float>()
               << ", max: " << hidden_states_last.max().item<float>()
               << ", mean: " << hidden_states_last.mean().item<float>()
               << ", std: " << hidden_states_last.std().item<float>();
 
-    // Verify that forward output is different from input embeddings
-    // (If they're the same, it means forward() is not actually going through
-    // transformer layers)
-    // input_embeddings should already be [batch_size, total_seq_len,
-    // hidden_size] from get_input_embeddings, so we don't need to reshape
-    CHECK_EQ(input_embeddings.dim(), 3)
-        << "input_embeddings should be 3D [batch, seq, hidden]";
-    auto embedding_mean = input_embeddings.mean().item<float>();
-    auto forward_mean = hidden_states_last.mean().item<float>();
-    auto embedding_std = input_embeddings.std().item<float>();
-    auto forward_std = hidden_states_last.std().item<float>();
-    LOG(INFO)
-        << "[LongCatImage] Comparison - Embedding vs Forward output: "
-        << "mean_diff: " << std::abs(forward_mean - embedding_mean)
-        << ", std_diff: " << std::abs(forward_std - embedding_std)
-        << " (should be significantly different if forward() works correctly)";
-
-    // Remove prefix and suffix tokens (same as diffusers: prompt_embeds[:,
-    // prefix_len:-suffix_len, :]) Now shape: [batch_size, max_sequence_length,
-    // hidden_size]
+    // Step 6: Remove prefix and suffix tokens
+    // This matches diffusers: prompt_embeds =
+    // text_output.hidden_states[-1].detach()
+    //                          prompt_embeds = prompt_embeds[:,
+    //                          prefix_len:-suffix_len, :]
+    // Result shape: [batch_size, max_sequence_length, hidden_size]
     torch::Tensor prompt_embeds =
         hidden_states_last.slice(1, prefix_len, total_seq_len - suffix_len);
 
-    // Step 6: Repeat for num_images_per_prompt
+    LOG(INFO) << "[LongCatImage] After removing prefix/suffix - shape: "
+              << prompt_embeds.sizes() << "\n[LongCatImage] Stats: min: "
+              << prompt_embeds.min().item<float>()
+              << ", max: " << prompt_embeds.max().item<float>()
+              << ", mean: " << prompt_embeds.mean().item<float>()
+              << ", std: " << prompt_embeds.std().item<float>();
+
+    // Step 7: Repeat for num_images_per_prompt (matches diffusers
+    // encode_prompt) duplicate text embeddings for each generation per prompt
     prompt_embeds = prompt_embeds.repeat({1, num_images_per_prompt, 1});
+    // Reshape: [batch_size, max_sequence_length * num_images_per_prompt,
+    // hidden_size]
+    //       -> [batch_size * num_images_per_prompt, max_sequence_length,
+    //       hidden_size]
     prompt_embeds = prompt_embeds.view(
         {batch_size * num_images_per_prompt, max_sequence_length, -1});
 
-    LOG(INFO) << "[LongCatImage] encode_prompt_qwen result shape: "
-              << prompt_embeds.sizes();
-    LOG(INFO) << "[LongCatImage] encode_prompt_qwen min: "
+    LOG(INFO) << "[LongCatImage] ===== encode_prompt_qwen Final Result ====="
+              << "\n[LongCatImage] Final shape: " << prompt_embeds.sizes()
+              << "\n[LongCatImage] Final stats: min: "
               << prompt_embeds.min().item<float>()
               << ", max: " << prompt_embeds.max().item<float>()
               << ", mean: " << prompt_embeds.mean().item<float>()

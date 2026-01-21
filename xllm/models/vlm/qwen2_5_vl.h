@@ -793,12 +793,68 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     return inputs_embeds;
   }
 
+  // Standard forward pass
   torch::Tensor forward(const torch::Tensor& tokens,
                         const torch::Tensor& positions,
                         std::vector<KVCache>& kv_caches,
                         const ModelInputParams& input_params) {
-    auto emb = language_model_(tokens, positions, kv_caches, input_params);
-    return emb;
+    return language_model_(tokens, positions, kv_caches, input_params);
+  }
+
+  // Special forward pass for LongCat-Image with attention_mask support
+  // This matches the diffusers implementation for proper text encoder output
+  // The attention_mask is [batch_size, seq_len] where 1 = real tokens, 0 =
+  // padding
+  torch::Tensor forward_longcat(const torch::Tensor& tokens,
+                                const torch::Tensor& positions,
+                                std::vector<KVCache>& kv_caches,
+                                const ModelInputParams& input_params,
+                                const torch::Tensor& attention_mask) {
+    // In diffusers, attention_mask is applied INSIDE the transformer layers
+    // This affects which tokens can attend to which via the attention mechanism
+    // To match this behavior in xllm without modifying the base language_model
+    // interface, we apply masking strategy: zero out embedding of padding
+    // tokens BEFORE transformer This ensures padding tokens have no meaningful
+    // contribution to attention
+
+    // Get embeddings for all tokens
+    // tokens shape: [batch_size * seq_len]
+    // returned shape: [batch_size * seq_len, hidden_size]
+    auto hidden_states = language_model_->get_input_embeddings(tokens);
+
+    // Apply attention mask to embeddings BEFORE transformer layers
+    // This ensures padding tokens (mask=0) don't pollute attention for other
+    // tokens
+    if (attention_mask.defined() && attention_mask.size(0) > 0) {
+      int64_t batch_size = attention_mask.size(0);
+      int64_t seq_len = attention_mask.size(1);
+      int64_t hidden_size = hidden_states.size(-1);
+
+      // attention_mask shape: [batch_size, seq_len]
+      // Flatten attention_mask to [batch_size * seq_len] to match tokens
+      auto mask_flat = attention_mask.view({-1});  // [batch_size * seq_len]
+
+      // Expand mask from [batch*seq] to [batch*seq, 1] for broadcasting
+      auto mask_expanded =
+          mask_flat.unsqueeze(-1).to(hidden_states.dtype());  // [batch*seq, 1]
+
+      // Zero out padding token embeddings: padding tokens have mask=0
+      // This prevents them from having any meaningful effect in transformer
+      // attention
+      hidden_states = hidden_states *
+                      mask_expanded;  // [batch*seq, hidden] * [batch*seq, 1]
+    }
+
+    // Now process through transformer layers with pre-masked embeddings
+    // Create a modified input_params with the pre-masked embeddings
+    auto modified_input_params = input_params;
+    modified_input_params.input_embedding = hidden_states;
+
+    // Call language model which will use the pre-masked embeddings
+    hidden_states =
+        language_model_(tokens, positions, kv_caches, modified_input_params);
+
+    return hidden_states;
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
