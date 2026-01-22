@@ -115,6 +115,11 @@ torch::Tensor Qwen2AttentionImpl::forward(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache) {
+  // DEBUG: Check if this method is being called
+  LOG(WARNING) << "[QWEN2_ATTENTION_DEBUG] Qwen2AttentionImpl::forward called, "
+                  "attn_mask.defined(): "
+               << attn_metadata.attn_mask.defined();
+
   // 1. qkv projection
   auto qkv = qkv_proj_->forward(hidden_states);
 
@@ -138,7 +143,12 @@ torch::Tensor Qwen2AttentionImpl::forward(
   k = k.view({T, kv_size_});
 
   // 5. store k/v cache and do attention
+  LOG(WARNING) << "[QWEN2_ATTENTION_DEBUG] About to call attn_->forward with "
+                  "attn_mask.defined(): "
+               << attn_metadata.attn_mask.defined()
+               << ", max_seq_len: " << attn_metadata.max_seq_len;
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
+  LOG(WARNING) << "[QWEN2_ATTENTION_DEBUG] Returned from attn_->forward";
 
   // 6. output projection
   return o_proj_->forward(out);

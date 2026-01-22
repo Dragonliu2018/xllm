@@ -98,7 +98,11 @@ void MRotaryEmbeddingImpl::forward(torch::Tensor& q,
                                    const AttentionMetadata& attn_metadata) {
   bool only_prefill =
       (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill);
-  if (!only_prefill || mrope_section_.empty()) {
+  // Use standard RoPE (not MRoPE) when:
+  // 1. Not in prefill mode, OR
+  // 2. mrope_section_ is empty (no MRoPE config), OR
+  // 3. positions is 1D (e.g., LongCat text encoding which doesn't need MRoPE)
+  if (!only_prefill || mrope_section_.empty() || positions.dim() == 1) {
     torch::Tensor position_ids = positions;
     if (positions.dim() == 2) {
       position_ids = positions[0];

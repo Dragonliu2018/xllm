@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/framework/tokenizer/tokenizer.h"
+#include "core/layers/cuda/flashinfer_workspace.h"
 #include "core/layers/pos_embedding.h"
 #include "dit.h"
 #include "flowmatch_euler_discrete_scheduler.h"
@@ -150,6 +151,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   LongCatImagePipelineImpl(const DiTModelContext& context) : context_(context) {
     const auto& model_args = context.get_model_args("vae");
     options_ = context.get_tensor_options();
+
+    // Initialize FlashinferWorkspace for attention operations
+    // This is required for batch_prefill to work correctly
+    layer::FlashinferWorkspace::get_instance().initialize(options_.device());
+
     vae_scale_factor_ = 1 << (model_args.block_out_channels().size() - 1);
     LOG(INFO) << "[LongCatImage] VAE block_out_channels size: "
               << model_args.block_out_channels().size()

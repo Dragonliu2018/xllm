@@ -46,10 +46,18 @@ AttentionMetadata AttentionMetadata::build(
 
   // for npu
   if (attn_mask.has_value()) {
-    attn_metadata.attn_mask = attn_mask.value();
+    auto mask = attn_mask.value();
+    if (mask.defined()) {
+      // Store attention mask as-is. Device and type conversion will be handled
+      // by the attention implementation (e.g., FlashInfer backend)
+      attn_metadata.attn_mask = mask;
+    } else {
+      attn_metadata.attn_mask = mask;
+    }
     // FIXME: The .to(kCPU) operation breaks ACL graph execution. The attention
     // operator needs to be updated to handle this.
-    attn_metadata.kv_seq_lens_host = params.kv_seq_lens.to(torch::kCPU);
+    // Don't convert when mask is present - it causes issues
+    attn_metadata.kv_seq_lens_host = params.kv_seq_lens;
   }
 
   attn_metadata.is_chunked_prefill =

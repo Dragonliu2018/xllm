@@ -812,22 +812,42 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
                                 const torch::Tensor& attention_mask) {
     // In diffusers, attention_mask is applied INSIDE the transformer layers
     // This affects which tokens can attend to which via the attention mechanism
-    // To match this behavior in xllm without modifying the base language_model
-    // interface, we apply masking strategy: zero out embedding of padding
-    // tokens BEFORE transformer This ensures padding tokens have no meaningful
-    // contribution to attention
+    // Since xllm's language_model doesn't support attention_mask directly,
+    // we use a masking strategy that:
+    // 1. Zero out embeddings of padding tokens BEFORE transformer
+    // 2. Pass attention_mask to graph_buffer for backends that support it
+    // 3. Zero out padding tokens in output to ensure consistency
+    // This ensures padding tokens have no meaningful contribution to the output
+
+    // Ensure kv_caches has enough space for all layers (for prefill, we don't
+    // use KV cache) The language_model expects kv_caches to have one element
+    // per layer Even though we set empty_kv_cache=true, the vector must be
+    // properly sized
+    if (kv_caches.size() == 0) {
+      // Get the number of layers from model_args
+      int num_layers = model_args_.n_layers();
+      kv_caches.resize(num_layers);  // Initialize with empty KVCache objects
+      LOG(WARNING) << "[forward_longcat] Initialized kv_caches with "
+                   << num_layers << " empty caches";
+    }
 
     // Get embeddings for all tokens
     // tokens shape: [batch_size * seq_len]
     // returned shape: [batch_size * seq_len, hidden_size]
     auto hidden_states = language_model_->get_input_embeddings(tokens);
 
-    // Apply attention mask to embeddings BEFORE transformer layers
-    // This ensures padding tokens (mask=0) don't pollute attention for other
-    // tokens
+    int64_t batch_size = 0;
+    int64_t seq_len = 0;
+    torch::Tensor mask_expanded;
+
+    // Apply attention mask to embeddings to ensure padding tokens are zeroed
+    // out This is important because:
+    // 1. It prevents padding token embeddings from affecting downstream layers
+    // 2. It ensures consistency with diffusers implementation
+    // 3. Even though attention layer also masks, pre-masking helps stability
     if (attention_mask.defined() && attention_mask.size(0) > 0) {
-      int64_t batch_size = attention_mask.size(0);
-      int64_t seq_len = attention_mask.size(1);
+      batch_size = attention_mask.size(0);
+      seq_len = attention_mask.size(1);
       int64_t hidden_size = hidden_states.size(-1);
 
       // attention_mask shape: [batch_size, seq_len]
@@ -835,24 +855,102 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
       auto mask_flat = attention_mask.view({-1});  // [batch_size * seq_len]
 
       // Expand mask from [batch*seq] to [batch*seq, 1] for broadcasting
-      auto mask_expanded =
+      mask_expanded =
           mask_flat.unsqueeze(-1).to(hidden_states.dtype());  // [batch*seq, 1]
 
-      // Zero out padding token embeddings: padding tokens have mask=0
-      // This prevents them from having any meaningful effect in transformer
-      // attention
-      hidden_states = hidden_states *
-                      mask_expanded;  // [batch*seq, hidden] * [batch*seq, 1]
+      // Zero out padding token embeddings at the source
+      hidden_states = hidden_states * mask_expanded;
     }
 
     // Now process through transformer layers with pre-masked embeddings
-    // Create a modified input_params with the pre-masked embeddings
+    // Create a modified input_params with the pre-masked embeddings and
+    // attention mask
     auto modified_input_params = input_params;
+
+    // CRITICAL FIX: Set proper sequence length and prefill flags for attention
+    // to work The input_params passed in may have seq_len = 0, which causes
+    // attention to skip processing We need to set it based on the actual token
+    // sequence length
+
+    // Ensure positions is 1D for LongCat encoding
+    // LongCat doesn't have H/W structure like image encoding, so MRoPE should
+    // not be applied
+    torch::Tensor positions_1d = positions;
+    if (positions.dim() == 2) {
+      // If positions comes in as 2D [batch, seq_len], flatten it to 1D
+      // [batch*seq_len]
+      positions_1d = positions.view({-1});
+      LOG(WARNING) << "[forward_longcat] Positions was 2D, flattened to 1D: "
+                   << positions_1d.sizes();
+    } else if (positions.dim() == 1) {
+      LOG(WARNING) << "[forward_longcat] Positions already 1D: "
+                   << positions_1d.sizes();
+    } else {
+      LOG(WARNING)
+          << "[forward_longcat] WARNING: Unexpected positions dimensions: "
+          << positions.dim();
+    }
+
+    int64_t actual_seq_len =
+        positions_1d.size(0);  // positions shape: [batch_size * seq_len]
+    LOG(WARNING) << "[forward_longcat] Setting seq_len: actual_seq_len="
+                 << actual_seq_len;
+
+    // Update input_params with correct sequence lengths for the transformer
+    // layers
+    if (actual_seq_len > 0) {
+      modified_input_params.q_max_seq_len = actual_seq_len;
+      modified_input_params.kv_max_seq_len = actual_seq_len;
+
+      // Also set q_seq_lens and kv_seq_lens as cumulative sequence lengths
+      // For prefill (all tokens at once), we have one sequence of length
+      // actual_seq_len
+      std::vector<int> cu_seqlens_vec = {0, static_cast<int>(actual_seq_len)};
+      torch::Tensor cu_seqlens =
+          torch::tensor(cu_seqlens_vec, torch::kInt).to(positions_1d.device());
+      modified_input_params.q_seq_lens = cu_seqlens;
+      modified_input_params.kv_seq_lens = cu_seqlens;
+
+      // Set batch_forward_type to PREFILL so that attention uses prefill path
+      // (not decode path which requires paged_kv_indptr)
+      // MRoPE is avoided by using 1D positions_1d instead of 2D positions
+      modified_input_params.batch_forward_type = BatchForwardType::PREFILL;
+      modified_input_params.empty_kv_cache = true;
+      modified_input_params.global_empty_kv_cache = true;
+    }
+
     modified_input_params.input_embedding = hidden_states;
 
-    // Call language model which will use the pre-masked embeddings
+    // Set attention mask in graph_buffer for transformer layers to use
+    // Flatten the mask from [batch, seq_len] to [batch * seq_len] to match the
+    // flattened token sequence
+    if (attention_mask.defined() && attention_mask.size(0) > 0) {
+      // Flatten attention_mask: [batch_size, seq_len] -> [batch_size * seq_len]
+      auto attn_mask_flat = attention_mask.view({-1});
+
+      // Ensure mask is float type for FlashInfer
+      // attention_mask format: 1.0 = attend, 0.0 = mask out (padding)
+      auto attn_mask_float = attn_mask_flat.to(torch::kFloat32);
+      modified_input_params.graph_buffer.attn_mask = attn_mask_float;
+
+      // Debug: Log mask information
+      VLOG(0) << "[forward_longcat] Set attention_mask in graph_buffer, "
+                 "flattened shape: ["
+              << attn_mask_float.size(0) << "]";
+    }
+
+    // Call language model which will use the pre-masked embeddings and
+    // attention mask Use positions_1d (flattened to 1D) to prevent MRoPE from
+    // being triggered
     hidden_states =
-        language_model_(tokens, positions, kv_caches, modified_input_params);
+        language_model_(tokens, positions_1d, kv_caches, modified_input_params);
+
+    // Apply attention mask to output to ensure padding tokens don't contribute
+    // This compensates for backends that don't support attention_mask (e.g.,
+    // CUDA) by completely zeroing out padding token outputs
+    if (mask_expanded.defined() && batch_size > 0 && seq_len > 0) {
+      hidden_states = hidden_states * mask_expanded;
+    }
 
     return hidden_states;
   }

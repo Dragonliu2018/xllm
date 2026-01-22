@@ -110,7 +110,22 @@ class LlmModelImplBase : public torch::nn::Module {
     auto modified_input_params = input_params;
     auto& dp_token_nums = modified_input_params.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
-    auto attn_metadata = layer::AttentionMetadata::build(modified_input_params);
+
+    // Check if attention_mask is set in graph_buffer
+    std::optional<torch::Tensor> attn_mask;
+    LOG(INFO) << "[llm_model_base] graph_buffer.attn_mask.defined() = "
+              << modified_input_params.graph_buffer.attn_mask.defined();
+    if (modified_input_params.graph_buffer.attn_mask.defined()) {
+      attn_mask = modified_input_params.graph_buffer.attn_mask;
+      LOG(INFO) << "[llm_model_base] Setting attn_mask, shape: "
+                << attn_mask.value().sizes();
+    }
+
+    auto attn_metadata =
+        layer::AttentionMetadata::build(modified_input_params, attn_mask);
+    LOG(INFO)
+        << "[llm_model_base] After build, attn_metadata.attn_mask.defined() = "
+        << attn_metadata.attn_mask.defined();
     if (positions.dim() == 2) {
       std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
           apply_mrope(positions);

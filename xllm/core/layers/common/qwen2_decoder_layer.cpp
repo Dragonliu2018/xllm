@@ -68,6 +68,11 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
     const ModelInputParams& input_params) {
+  // DEBUG: Check if decoder layer is being called
+  LOG(WARNING) << "[QWEN2_DECODER_DEBUG] Qwen2DecoderLayerImpl::forward "
+                  "called, attn_mask.defined(): "
+               << attn_metadata.attn_mask.defined();
+
   // Pre-attention norm
   if (!residual.has_value()) {
     residual = x;
@@ -77,6 +82,9 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
   }
 
   // Attention
+  LOG(WARNING) << "[QWEN2_DECODER_DEBUG] Calling attention_->forward with "
+                  "attn_mask.defined(): "
+               << attn_metadata.attn_mask.defined();
   x = attention_->forward(positions, x, attn_metadata, kv_cache);
 
   // Post-attention norm
