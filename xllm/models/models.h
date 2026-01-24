@@ -64,6 +64,7 @@ limitations under the License.
 #include "llm/qwen3.h"      // IWYU pragma: keep
 #include "llm/qwen3_moe.h"  // IWYU pragma: keep
 #else
+#include "llm/mimo.h"                // IWYU pragma: keep
 #include "llm/qwen2.h"               // IWYU pragma: keep
 #include "llm/qwen3.h"               // IWYU pragma: keep
 #include "llm/qwen3_moe.h"           // IWYU pragma: keep
