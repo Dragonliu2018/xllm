@@ -876,22 +876,19 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
 
     modified_input_params.input_embedding = hidden_states;
 
-    // Set attention mask in graph_buffer for transformer layers to use
-    // Flatten the mask from [batch, seq_len] to [batch * seq_len] to match the
-    // flattened token sequence
+    // Set attention mask in graph_buffer for transformer layers to use.
+    // batch_prefill expects a 1D binary mask: 1 = attend (real token), 0 = mask
+    // (padding). It builds causal+padding combined mask and converts to
+    // additive internally. Do NOT pass additive (0/-inf) here.
     if (attention_mask.defined() && attention_mask.size(0) > 0) {
-      // Flatten attention_mask: [batch_size, seq_len] -> [batch_size * seq_len]
-      auto attn_mask_flat = attention_mask.view({-1});
+      auto attn_mask_flat = attention_mask.view({-1}).to(torch::kFloat32);
+      modified_input_params.graph_buffer.attn_mask = attn_mask_flat;
 
-      // Ensure mask is float type for FlashInfer
-      // attention_mask format: 1.0 = attend, 0.0 = mask out (padding)
-      auto attn_mask_float = attn_mask_flat.to(torch::kFloat32);
-      modified_input_params.graph_buffer.attn_mask = attn_mask_float;
-
-      // Debug: Log mask information
-      VLOG(0) << "[forward_longcat] Set attention_mask in graph_buffer, "
-                 "flattened shape: ["
-              << attn_mask_float.size(0) << "]";
+      LOG(INFO) << "[forward_longcat] Set attention_mask in graph_buffer - "
+                   "binary 1=attend 0=pad, shape: ["
+                << attn_mask_flat.size(0) << "], first 20: "
+                << attn_mask_flat.slice(
+                       0, 0, std::min(20L, attn_mask_flat.size(0)));
     }
 
     // Call language model which will use the pre-masked embeddings and

@@ -75,9 +75,14 @@ class LlmModelImplBase : public torch::nn::Module {
     auto& dp_token_nums = modified_input_params.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
     if (!modified_input_params.attn_metadata) {
+      std::optional<torch::Tensor> attn_mask_opt;
+      if (modified_input_params.graph_buffer.attn_mask.defined()) {
+        attn_mask_opt = modified_input_params.graph_buffer.attn_mask;
+      }
       modified_input_params.attn_metadata =
           std::make_shared<layer::AttentionMetadata>(
-              layer::AttentionMetadataBuilder::build(modified_input_params));
+              layer::AttentionMetadataBuilder::build(
+                  modified_input_params, "float", attn_mask_opt));
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
     if (positions.dim() == 2) {

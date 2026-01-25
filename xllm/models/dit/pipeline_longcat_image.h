@@ -818,7 +818,11 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
               << positions_1d.slice(0, 0, 10)
               << ", positions_1d sample (around padding start "
               << prefix_len - 5 << "-" << prefix_len + 5
-              << "): " << positions_1d.slice(0, prefix_len - 5, prefix_len + 5);
+              << "): " << positions_1d.slice(0, prefix_len - 5, prefix_len + 5)
+              << ", positions_1d sample (last 10): "
+              << positions_1d.slice(0,
+                                    std::max(0L, positions_1d.size(0) - 10),
+                                    positions_1d.size(0));
 
     // Prepare empty kv_caches for forward pass
     std::vector<KVCache> kv_caches;
