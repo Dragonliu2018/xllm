@@ -968,6 +968,7 @@ REGISTER_MODEL_ARGS(qwen2_5_vl, [&] {
   // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);
   LOAD_ARG_OR(eos_token_id, "eos_token_id", 151645);
+  LOAD_ARG_OR(pad_token_id, "pad_token_id", 151643);
   LOAD_ARG_OR(vision_start_token_id, "vision_start_token_id", 151652);
   LOAD_ARG_OR(vision_end_token_id, "vision_end_token_id", 151653);
   LOAD_ARG_OR(vision_token_id, "vision_token_id", 151654);
@@ -1028,6 +1029,7 @@ REGISTER_MODEL_ARGS(Qwen2_5_VLForConditionalGeneration, [&] {
   // LOAD_ARG_OR(attention_dropout, "attention_dropout", 0.0);
   LOAD_ARG_OR(bos_token_id, "bos_token_id", 151643);
   LOAD_ARG_OR(eos_token_id, "eos_token_id", 151645);
+  LOAD_ARG_OR(pad_token_id, "pad_token_id", 151643);
   LOAD_ARG_OR(vision_start_token_id, "vision_start_token_id", 151652);
   LOAD_ARG_OR(vision_end_token_id, "vision_end_token_id", 151653);
   LOAD_ARG_OR(vision_token_id, "vision_token_id", 151654);
@@ -1076,9 +1078,12 @@ REGISTER_MODEL_ARGS(Qwen2_5_VLForConditionalGeneration, [&] {
     return args->mm_hidden_size() / args->mm_num_attention_heads();
   });
 
-  LOAD_ARG_OR(
-      rope_scaling_rope_type, "vision_config.rope_scaling.type", "mrope");
-  LOAD_ARG(rope_scaling_mrope_section, "rope_scaling.mrope_section");
+  // LongCat-Image text_encoder: config at text_encoder/config.json is flat.
+  // rope_scaling at root: {"type":"mrope","mrope_section":[16,24,24]}
+  LOAD_ARG_OR(rope_scaling_rope_type, "rope_scaling.type", "mrope");
+  LOAD_ARG_OR(rope_scaling_mrope_section,
+              "rope_scaling.mrope_section",
+              std::vector<int64_t>{});
   LOAD_ARG_OR(vocab_size, "vocab_size", 152064);
 });
 }  // namespace xllm

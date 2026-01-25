@@ -704,13 +704,21 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     }
 
     // Step 2: Pad tokens to max_sequence_length
-    // Find pad_token_id (typically 151643 for Qwen2, but we'll use 0 as
-    // default)
-    int32_t pad_token_id = 0;
-    auto pad_id = tokenizer_->token_to_id("<|endoftext|>");
-    if (pad_id.has_value()) {
-      pad_token_id = pad_id.value();
+    // Use pad_token_id from text_encoder model config (151643 for Qwen2) to
+    // match diffusers. Fallback: tokenizer "<|endoftext|>", then 151643.
+    int32_t pad_token_id =
+        context_.get_model_args("text_encoder").pad_token_id();
+    if (pad_token_id == 0) {
+      auto pad_id = tokenizer_->token_to_id("<|endoftext|>");
+      if (pad_id.has_value()) {
+        pad_token_id = pad_id.value();
+      }
+      if (pad_token_id == 0) {
+        pad_token_id = 151643;  // Qwen2 default, matches diffusers
+      }
     }
+    LOG(INFO) << "[LongCatImage] encode_prompt_qwen pad_token_id: "
+              << pad_token_id << " (must match diffusers, typically 151643)";
 
     // Pad each sequence
     for (auto& tokens : batch_all_tokens) {
@@ -858,9 +866,87 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
     torch::Tensor hidden_states_flat = text_encoder_->forward_longcat(
         tokens_flat, positions_2d, kv_caches, input_params, attention_mask);
 
+    // Debug: Output sample values from encoded hidden states
+    int64_t hidden_size = hidden_states_flat.size(-1);
+    int64_t flat_seq_len = hidden_states_flat.size(0);
+    LOG(INFO) << "[LongCatImage] [DEBUG] hidden_states_flat shape: "
+              << hidden_states_flat.sizes();
+
+    // Sample values from first position (first token embedding)
+    if (flat_seq_len > 0) {
+      auto first_pos =
+          hidden_states_flat[0].slice(0, 0, std::min(10L, hidden_size));
+      LOG(INFO)
+          << "[LongCatImage] [DEBUG] First position (token 0) - first 10 dims: "
+          << first_pos;
+    }
+
+    // Sample values from prefix_len position (start of actual prompt)
+    if (flat_seq_len > prefix_len) {
+      auto prefix_pos = hidden_states_flat[prefix_len].slice(
+          0, 0, std::min(10L, hidden_size));
+      LOG(INFO) << "[LongCatImage] [DEBUG] Prefix position (token "
+                << prefix_len << ") - first 10 dims: " << prefix_pos;
+    }
+
+    // Sample values from middle position
+    int64_t mid_pos_idx =
+        prefix_len + (total_seq_len - prefix_len - suffix_len) / 2;
+    if (flat_seq_len > mid_pos_idx) {
+      auto mid_pos = hidden_states_flat[mid_pos_idx].slice(
+          0, 0, std::min(10L, hidden_size));
+      LOG(INFO) << "[LongCatImage] [DEBUG] Middle position (token "
+                << mid_pos_idx << ") - first 10 dims: " << mid_pos;
+    }
+
+    // Sample values from last valid position (before suffix)
+    int64_t last_valid_idx = total_seq_len - suffix_len - 1;
+    if (flat_seq_len > last_valid_idx && last_valid_idx >= 0) {
+      auto last_pos = hidden_states_flat[last_valid_idx].slice(
+          0, 0, std::min(10L, hidden_size));
+      LOG(INFO) << "[LongCatImage] [DEBUG] Last valid position (token "
+                << last_valid_idx << ") - first 10 dims: " << last_pos;
+    }
+
+    // Sample values from last position (suffix end)
+    if (flat_seq_len > 0) {
+      auto last_all_pos = hidden_states_flat[flat_seq_len - 1].slice(
+          0, 0, std::min(10L, hidden_size));
+      LOG(INFO) << "[LongCatImage] [DEBUG] Last position (token "
+                << (flat_seq_len - 1) << ") - first 10 dims: " << last_all_pos;
+    }
+
+    // Additional debug: Statistics for key positions
+    if (flat_seq_len > 0) {
+      auto first_token_stats = hidden_states_flat[0];
+      LOG(INFO) << "[LongCatImage] [DEBUG] First token stats - min: "
+                << first_token_stats.min().item<float>()
+                << ", max: " << first_token_stats.max().item<float>()
+                << ", mean: " << first_token_stats.mean().item<float>()
+                << ", std: " << first_token_stats.std().item<float>();
+    }
+
+    if (flat_seq_len > prefix_len) {
+      auto prefix_token_stats = hidden_states_flat[prefix_len];
+      LOG(INFO) << "[LongCatImage] [DEBUG] Prefix token (idx " << prefix_len
+                << ") stats - min: " << prefix_token_stats.min().item<float>()
+                << ", max: " << prefix_token_stats.max().item<float>()
+                << ", mean: " << prefix_token_stats.mean().item<float>()
+                << ", std: " << prefix_token_stats.std().item<float>();
+    }
+
+    // Sample a few more positions around prefix boundary for comparison
+    for (int64_t i = std::max(0L, prefix_len - 2);
+         i < std::min(flat_seq_len, prefix_len + 3);
+         ++i) {
+      auto pos_sample =
+          hidden_states_flat[i].slice(0, 0, std::min(5L, hidden_size));
+      LOG(INFO) << "[LongCatImage] [DEBUG] Position " << i
+                << " - first 5 dims: " << pos_sample;
+    }
+
     // Reshape: [batch_size * total_seq_len, hidden_size] -> [batch_size,
     // total_seq_len, hidden_size]
-    int64_t hidden_size = hidden_states_flat.size(-1);
     torch::Tensor hidden_states_last =
         hidden_states_flat.view({batch_size, total_seq_len, hidden_size});
 

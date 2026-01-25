@@ -49,23 +49,15 @@ void apply_rotary(RotaryParams& params) {
       params.q, params.k, params.cos_sin, params.position_ids.value());
 #elif defined(USE_CUDA)
   bool is_neox = !params.interleaved;
-
-  // NOTE:
-  // For standard RoPE, CUDA path expects explicit position_ids.
-  // For MRoPE (multimodal RoPE), we may not have position_ids and instead rely
-  // on cu_query_lens and precomputed cos/sin. However, the current CUDA
-  // implementation only supports the standard RoPE kernel.
-  //
-  // To avoid crashes (std::bad_optional_access) while preserving behavior as
-  // much as possible, we:
-  // - Use provided position_ids when available (standard RoPE).
-  // - If position_ids is absent but cu_query_lens is provided (prefill path),
-  //   synthesize a simple sequential position_ids [0, 1, ..., T-1].
-  //   This effectively falls back to standard RoPE semantics, which matches
-  //   the previous xllm behavior for text-only use cases.
   torch::Tensor pos_ids;
+  torch::Tensor cos_sin;
+
   if (params.position_ids.has_value()) {
     pos_ids = params.position_ids.value().to(torch::kInt64);
+    auto cos_sin_vec = params.cos_sin.chunk(4, -1);
+    auto cos = cos_sin_vec[0];
+    auto sin = cos_sin_vec[2];
+    cos_sin = torch::cat({cos, sin}, -1);
   } else if (params.cu_query_lens.has_value()) {
     auto cu = params.cu_query_lens.value().to(torch::kInt64);
     TORCH_CHECK(
@@ -81,17 +73,27 @@ void apply_rotary(RotaryParams& params) {
                                 .dtype(torch::kInt64)
                                 .device(params.q.device()))
                   .contiguous();
+
+    // MRoPE path: use precomputed per-token cos/sin (mrope_cos, mrope_sin).
+    // They have shape [num_tokens, rot_dim/2] each; we use them instead of
+    // indexing the 1D RoPE cache. Index with [0,1,...,T-1] to fetch each row.
+    if (params.cos.defined() && params.sin.defined() &&
+        params.cos.size(0) == static_cast<int64_t>(T) &&
+        params.sin.size(0) == static_cast<int64_t>(T)) {
+      cos_sin =
+          torch::cat({params.cos.contiguous(), params.sin.contiguous()}, -1);
+    } else {
+      auto cos_sin_vec = params.cos_sin.chunk(4, -1);
+      auto cos = cos_sin_vec[0];
+      auto sin = cos_sin_vec[2];
+      cos_sin = torch::cat({cos, sin}, -1);
+    }
   } else {
     TORCH_CHECK(
         false,
         "apply_rotary (CUDA): neither position_ids nor cu_query_lens provided; "
         "cannot infer positions.");
   }
-
-  auto cos_sin_vec = params.cos_sin.chunk(4, -1);
-  auto cos = cos_sin_vec[0];
-  auto sin = cos_sin_vec[2];
-  auto cos_sin = torch::cat({cos, sin}, -1);
 
   cuda::rotary_embedding(pos_ids, params.q, params.k, cos_sin, is_neox);
 #elif defined(USE_ILU)

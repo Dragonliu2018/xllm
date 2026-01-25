@@ -41,6 +41,13 @@ class LlmModelImplBase : public torch::nn::Module {
       this->layer_forward_interrupted_ = interrupted;
     });
     mrope_section_ = args.rope_scaling_mrope_section();
+    if (mrope_section_.empty()) {
+      LOG(WARNING) << "[llm_model_base] mrope_section_ is empty for model_type="
+                   << model_type_ << ". MRoPE will not work correctly.";
+    } else {
+      LOG(INFO) << "[llm_model_base] Loaded mrope_section_ size="
+                << mrope_section_.size() << " for model_type=" << model_type_;
+    }
   }
 
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
@@ -85,7 +92,9 @@ class LlmModelImplBase : public torch::nn::Module {
                   modified_input_params, "float", attn_mask_opt));
     }
     auto& attn_metadata = *(modified_input_params.attn_metadata);
-    if (positions.dim() == 2) {
+    if (positions.dim() == 2 && !mrope_section_.empty()) {
+      LOG(INFO) << "[llm_model_base] Using MRoPE with mrope_section size "
+                << mrope_section_.size();
       std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
           apply_mrope(positions);
     } else if (positions.dim() == 2 && mrope_section_.empty()) {
