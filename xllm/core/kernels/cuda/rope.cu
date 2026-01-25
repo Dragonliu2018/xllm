@@ -160,16 +160,14 @@ void rotary_embedding(
                            // [batch_size, seq_len, num_heads, head_size] or
                            // [num_tokens, num_heads, head_size]
     std::optional<torch::Tensor> key,
-    // null or
-    // [batch_size, seq_len, num_kv_heads * head_size] or
-    // [num_tokens, num_kv_heads * head_size] or
-    // [batch_size, seq_len, num_heads, head_size] or
-    // [num_tokens, num_heads, head_size]
-    // int64_t head_size,
     torch::Tensor& cos_sin_cache,  // [max_position, rot_dim]
-    bool is_neox) {
+    bool is_neox,
+    std::optional<int64_t> override_head_size) {
   // num_tokens = batch_size * seq_len
-  int64_t head_size = cos_sin_cache.size(-1);
+  // Use override_head_size when cos_sin is [T, 2*head_dim] (MRoPE precomputed).
+  int64_t head_size = override_head_size.has_value()
+                          ? override_head_size.value()
+                          : cos_sin_cache.size(-1);
   int64_t num_tokens = positions.numel();
   int positions_ndim = positions.dim();
 

@@ -119,6 +119,17 @@ class LlmModelImplBase : public torch::nn::Module {
                 attn_metadata,
                 kv_caches[i],
                 modified_input_params);
+      if (i == 0 && h.size(0) > 36) {
+        int64_t hd = h.size(-1);
+        auto l0_0 = h[0].slice(0, 0, std::min(10L, hd));
+        auto l0_36 = h[36].slice(0, 0, std::min(10L, hd));
+        LOG(INFO)
+            << "[LongCatImage] [DEBUG] After layer 0 - token 0 first 10 dims: "
+            << l0_0;
+        LOG(INFO)
+            << "[LongCatImage] [DEBUG] After layer 0 - token 36 first 10 dims: "
+            << l0_36;
+      }
     }
     return std::get<0>(norm_(h, residual));
   }

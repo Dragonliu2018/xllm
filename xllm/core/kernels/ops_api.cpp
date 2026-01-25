@@ -25,6 +25,8 @@ limitations under the License.
 #include "ilu/ilu_ops_api.h"
 #endif
 
+#include <glog/logging.h>
+
 #include <numeric>
 
 #include "common/macros.h"
@@ -51,6 +53,7 @@ void apply_rotary(RotaryParams& params) {
   bool is_neox = !params.interleaved;
   torch::Tensor pos_ids;
   torch::Tensor cos_sin;
+  std::optional<int64_t> override_head_size = std::nullopt;
 
   if (params.position_ids.has_value()) {
     pos_ids = params.position_ids.value().to(torch::kInt64);
@@ -77,11 +80,33 @@ void apply_rotary(RotaryParams& params) {
     // MRoPE path: use precomputed per-token cos/sin (mrope_cos, mrope_sin).
     // They have shape [num_tokens, rot_dim/2] each; we use them instead of
     // indexing the 1D RoPE cache. Index with [0,1,...,T-1] to fetch each row.
-    if (params.cos.defined() && params.sin.defined() &&
+    // cos_sin is [T, 2*head_dim]; kernel must use head_size=head_dim, not
+    // 2*head_dim.
+    const bool use_mrope_precomputed =
+        params.cos.defined() && params.sin.defined() &&
         params.cos.size(0) == static_cast<int64_t>(T) &&
-        params.sin.size(0) == static_cast<int64_t>(T)) {
+        params.sin.size(0) == static_cast<int64_t>(T);
+    if (use_mrope_precomputed) {
       cos_sin =
           torch::cat({params.cos.contiguous(), params.sin.contiguous()}, -1);
+      override_head_size = params.cos.size(-1);
+      // Debug: verify cos/sin values passed to CUDA kernel
+      if (params.cos.size(0) > 0 && params.cos.size(0) > 36) {
+        auto cos0_sample =
+            params.cos[0].slice(0, 0, std::min(10L, params.cos.size(-1)));
+        auto sin0_sample =
+            params.sin[0].slice(0, 0, std::min(10L, params.sin.size(-1)));
+        auto cos36_sample =
+            params.cos[36].slice(0, 0, std::min(10L, params.cos.size(-1)));
+        auto sin36_sample =
+            params.sin[36].slice(0, 0, std::min(10L, params.sin.size(-1)));
+        LOG(INFO) << "[apply_rotary MRoPE] cos_sin shape: " << cos_sin.sizes()
+                  << ", override_head_size: " << override_head_size.value()
+                  << ", token 0 cos[0:10]: " << cos0_sample
+                  << ", sin[0:10]: " << sin0_sample
+                  << ", token 36 cos[0:10]: " << cos36_sample
+                  << ", sin[0:10]: " << sin36_sample;
+      }
     } else {
       auto cos_sin_vec = params.cos_sin.chunk(4, -1);
       auto cos = cos_sin_vec[0];
@@ -95,7 +120,8 @@ void apply_rotary(RotaryParams& params) {
         "cannot infer positions.");
   }
 
-  cuda::rotary_embedding(pos_ids, params.q, params.k, cos_sin, is_neox);
+  cuda::rotary_embedding(
+      pos_ids, params.q, params.k, cos_sin, is_neox, override_head_size);
 #elif defined(USE_ILU)
   auto cos_sin_vec = params.cos_sin.chunk(4, -1);
   auto cos = cos_sin_vec[0];

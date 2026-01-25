@@ -25,13 +25,16 @@ limitations under the License.
 
 namespace xllm::kernel::cuda {
 
-// TODO: add head_size parameter
+// When override_head_size is set (e.g. MRoPE precomputed cos/sin), use it
+// as head_size instead of cos_sin_cache.size(-1). Required when cache has
+// shape [num_tokens, 2*head_dim] (cos|sin) so rot_dim=2*head_dim but
+// num_heads = hidden_size / head_dim.
 void rotary_embedding(torch::Tensor& positions,
                       torch::Tensor& query,
                       std::optional<torch::Tensor> key,
                       torch::Tensor& cos_sin_cache,
-                      // int64_t head_size,
-                      bool is_neox);
+                      bool is_neox,
+                      std::optional<int64_t> override_head_size = std::nullopt);
 
 // act_mode only support silu, gelu, gelu_tanh
 void act_and_mul(torch::Tensor out,

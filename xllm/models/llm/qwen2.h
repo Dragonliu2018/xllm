@@ -35,6 +35,11 @@ class QWen2ModelImpl : public LlmModelImplBase<layer::Qwen2DecoderLayer> {
           model_args.max_position_embeddings(),
           model_args.rope_theta(),
           options);
+      // Debug: log cos_sin_ cache info
+      LOG(INFO) << "[QWen2Model] cos_sin_ cache created - shape: "
+                << cos_sin_.sizes() << ", dtype: " << cos_sin_.dtype()
+                << ", sample (pos 0 first 10): " << cos_sin_[0].slice(0, 0, 10)
+                << ", sample (pos 1 first 10): " << cos_sin_[1].slice(0, 0, 10);
     }
 
     layers_.reserve(model_args.n_layers());
@@ -49,10 +54,20 @@ class QWen2ModelImpl : public LlmModelImplBase<layer::Qwen2DecoderLayer> {
   }
   std::pair<torch::Tensor, torch::Tensor> apply_mrope(
       const torch::Tensor positions) override {
-    auto target_cos_sin = cos_sin_.index({positions});
+    // Use F::embedding instead of index() to correctly handle 2D positions
+    // For positions [3, seq_len], F::embedding returns [3, seq_len, head_dim*2]
+    namespace F = torch::nn::functional;
+
+    auto target_cos_sin = F::embedding(positions, cos_sin_);
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = target_cos_sin_chunks[0].contiguous();
     auto sin_pos = target_cos_sin_chunks[1].contiguous();
+
+    // Debug: log shapes before reshape
+    LOG(INFO) << "[apply_mrope] Before reshape - cos_pos shape: "
+              << cos_pos.sizes()
+              << ", positions.size(0): " << positions.size(0);
+
     auto apply = [this](torch::Tensor x) {
       auto sections = mrope_section_;
       sections.insert(sections.end(), sections.begin(), sections.end());
@@ -69,6 +84,22 @@ class QWen2ModelImpl : public LlmModelImplBase<layer::Qwen2DecoderLayer> {
     };
     cos_pos = apply(cos_pos.reshape({positions.size(0), -1, cos_pos.size(-1)}));
     sin_pos = apply(sin_pos.reshape({positions.size(0), -1, sin_pos.size(-1)}));
+
+    // Debug: log cos/sin after reorder for token 0 and token 36
+    if (cos_pos.size(0) > 0) {
+      auto cos0 = cos_pos[0].slice(0, 0, std::min(10L, cos_pos.size(-1)));
+      auto sin0 = sin_pos[0].slice(0, 0, std::min(10L, sin_pos.size(-1)));
+      LOG(INFO) << "[apply_mrope] after reorder shape: " << cos_pos.sizes()
+                << ", token 0 cos[0:10]: " << cos0 << ", sin[0:10]: " << sin0;
+      if (cos_pos.size(0) > 36) {
+        auto cos36 = cos_pos[36].slice(0, 0, std::min(10L, cos_pos.size(-1)));
+        auto sin36 = sin_pos[36].slice(0, 0, std::min(10L, sin_pos.size(-1)));
+        LOG(INFO) << "[apply_mrope] token 36 positions: "
+                  << positions.select(1, 36) << ", cos[0:10]: " << cos36
+                  << ", sin[0:10]: " << sin36;
+      }
+    }
+
     return std::make_pair(cos_pos, sin_pos);
   }
 };
