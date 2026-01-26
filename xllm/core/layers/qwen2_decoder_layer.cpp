@@ -71,13 +71,10 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
                   "called, attn_mask.defined(): "
                << attn_metadata.attn_mask.defined();
 
-  // Pre-attention norm
-  if (!residual.has_value()) {
-    residual = x;
-    x = std::get<0>(input_norm_->forward(x));
-  } else {
-    std::tie(x, residual) = input_norm_->forward(x, residual);
-  }
+  // Pre-attention norm: Qwen2 norms input only (no residual add). Reset
+  // residual to layer input each time so post_norm/MLP use correct residual.
+  residual = x;
+  x = std::get<0>(input_norm_->forward(x));
 
   // Attention
   LOG(WARNING) << "[QWEN2_DECODER_DEBUG] Calling attention_->forward with "
@@ -85,12 +82,14 @@ torch::Tensor Qwen2DecoderLayerImpl::forward(
                << attn_metadata.attn_mask.defined();
   x = attention_->forward(positions, x, attn_metadata, kv_cache);
 
-  // Post-attention norm
+  // Post-attention norm: x = norm(attn + residual), residual = attn + residual
   std::tie(x, residual) = post_norm_->forward(x, residual);
 
-  // MLP forward
+  // MLP forward; Qwen2 then adds residual (emb + attn) to MLP output
   x = mlp_->forward(x);
-
+  if (residual.has_value()) {
+    x = x + residual.value();
+  }
   return x;
 }
 

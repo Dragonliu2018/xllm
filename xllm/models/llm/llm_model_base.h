@@ -131,7 +131,8 @@ class LlmModelImplBase : public torch::nn::Module {
             << l0_36;
       }
     }
-    return std::get<0>(norm_(h, residual));
+    // Final norm: Qwen2 norms hidden_states only (no residual add)
+    return std::get<0>(norm_->forward(h));
   }
 
   // load the weight from the checkpoint
