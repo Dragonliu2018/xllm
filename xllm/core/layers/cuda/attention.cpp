@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "attention.h"
 
+#include <limits>
+
 #include "core/common/global_flags.h"
 #include "flashinfer_planinfo.h"
 #include "flashinfer_workspace.h"
@@ -160,6 +162,84 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
   if (attn_metadata.is_prefill) {
     attention_params.key = key;
     attention_params.value = value;
+    // Eager PyTorch attention fallback when custom mask (LongCat
+    // padding+causal). FlashInfer custom mask gives wrong token-0 output; eager
+    // matches diffusers.
+    if (use_custom_mask && attn_metadata.attn_mask.defined()) {
+      LOG(INFO) << "[attention] Using eager attention fallback (custom mask)";
+      torch::Tensor m = attn_metadata.attn_mask;
+      if (m.device() != query.device()) m = m.to(query.device());
+      if (!m.is_floating_point()) m = m.to(torch::kFloat32);
+      int64_t T = query.size(0);
+      CHECK_EQ(m.size(0), T) << "[eager attention] mask length " << m.size(0)
+                             << " != query seq len " << T;
+      auto device = query.device();
+      auto causal = torch::tril(torch::ones(
+          {T, T},
+          torch::TensorOptions().dtype(torch::kFloat32).device(device)));
+      auto pad2d = m.unsqueeze(0).expand({T, T});
+      auto combined = (causal * pad2d).to(torch::kFloat32);
+      const float mask_val = -std::numeric_limits<float>::infinity();
+      auto add_mask = torch::where(combined > 0.5f,
+                                   torch::zeros_like(combined),
+                                   torch::full_like(combined, mask_val));
+      int64_t g = num_heads_ / num_kv_heads_;
+      // [T,K,D] -> [T,K,D,1] -> [T,K,D,g] -> permute to [T,K,g,D] -> [T,K*g,D].
+      // Head h = kv_head k, replicate r: h = k*g + r; each head gets full D
+      // dims.
+      auto Kg = key.unsqueeze(3).expand({-1, -1, -1, g});
+      auto Vg = value.unsqueeze(3).expand({-1, -1, -1, g});
+      torch::Tensor Kr =
+          Kg.permute({0, 1, 3, 2}).reshape({-1, num_heads_, head_size_});
+      torch::Tensor Vr =
+          Vg.permute({0, 1, 3, 2}).reshape({-1, num_heads_, head_size_});
+      auto Qf = query.to(torch::kFloat32);
+      auto Kf = Kr.to(torch::kFloat32);
+      // scores[t,h,j] = sum_d Q[t,h,d]*K[j,h,d]. Use
+      // (T,H,1,D)*(1,H,T,D)->(T,H,T,D)->sum(-1).
+      auto Kf_1HTD = Kf.permute({1, 0, 2}).unsqueeze(0);  // [1, H, T, D]
+      auto scores = (Qf.unsqueeze(2) * Kf_1HTD).sum(-1) * scale_;
+      scores = scores + add_mask.unsqueeze(1);
+      // Match diffusers: softmax in float32, cast attn to query dtype, matmul
+      // with V (same dtype).
+      auto attn = torch::softmax(scores.to(torch::kFloat32), -1)
+                      .to(query.scalar_type());
+      auto out = torch::einsum("thj,jhd->thd", {attn, Vr});
+      out = out.contiguous();
+      auto result = out.view({-1, num_heads_ * head_size_});
+      // Token-0 and token-36 diagnostic (causal: out[0,h,:] must equal
+      // V[0,h,:]; head 0).
+      if (attn_metadata.plan_info && T > 0 &&
+          attn_metadata.plan_info->layer_id == 0) {
+        const int64_t n10 =
+            (10 < head_size_) ? 10 : static_cast<int64_t>(head_size_);
+        // Token 0
+        auto a0 = attn[0].slice(0, 0, 1).slice(1, 0, 5).flatten();
+        auto o0 = out[0].slice(0, 0, 1).slice(1, 0, n10).flatten();
+        auto v0 = Vr[0].slice(0, 0, 1).slice(1, 0, n10).flatten();
+        float max_err0 =
+            static_cast<float>((o0 - v0).abs().max().item().toDouble());
+        auto ret_first10_0 = result[0].slice(0, 0, n10);
+        LOG(INFO) << "[eager attention] layer 0 token-0: attn[0,0,:5]=" << a0
+                  << ", |out[0,0,:10]-V[0,0,:10]|_max=" << max_err0
+                  << ", result[0,:10]=" << ret_first10_0
+                  << " (vs out[0,0,:10]=" << o0 << ")";
+        if (max_err0 > 1e-2f) {
+          LOG(WARNING) << "[eager attention] token-0 mismatch: out[0,0,:10]="
+                       << o0 << ", Vr[0,0,:10]=" << v0;
+        }
+        // Token 36
+        if (T > 36) {
+          auto a36 = attn[36].slice(0, 0, 1).slice(1, 0, 5).flatten();
+          auto o36 = out[36].slice(0, 0, 1).slice(1, 0, n10).flatten();
+          auto ret_first10_36 = result[36].slice(0, 0, n10);
+          LOG(INFO) << "[eager attention] layer 0 token-36: attn[36,0,:5]="
+                    << a36 << ", result[36,:10]=" << ret_first10_36
+                    << " (vs out[36,0,:10]=" << o36 << ")";
+        }
+      }
+      return {result, output_lse};
+    }
     xllm::kernel::batch_prefill(attention_params);
   } else {
     attention_params.query = query;

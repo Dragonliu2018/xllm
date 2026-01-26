@@ -142,6 +142,37 @@ torch::Tensor Qwen2AttentionImpl::forward(
   q = q.view({T, q_size_});
   k = k.view({T, kv_size_});
 
+  // Debug: Log Q, K, V for token 0 and 36 - to compare with diffusers
+  // Note: v doesn't get RoPE, so it's unchanged after qkv_proj
+  if (T > 0) {
+    auto q0 = q[0].slice(0, 0, std::min(10L, q.size(-1)));
+    auto k0 = k[0].slice(0, 0, std::min(10L, k.size(-1)));
+    auto v0 = v[0].slice(0, 0, std::min(10L, v.size(-1)));
+    LOG(INFO) << "[LongCatImage] [DEBUG] Q (query, after RoPE) token 0 first "
+                 "10 dims: "
+              << q0;
+    LOG(INFO)
+        << "[LongCatImage] [DEBUG] K (key, after RoPE) token 0 first 10 dims: "
+        << k0;
+    LOG(INFO)
+        << "[LongCatImage] [DEBUG] V (value, no RoPE) token 0 first 10 dims: "
+        << v0;
+  }
+  if (T > 36) {
+    auto q36 = q[36].slice(0, 0, std::min(10L, q.size(-1)));
+    auto k36 = k[36].slice(0, 0, std::min(10L, k.size(-1)));
+    auto v36 = v[36].slice(0, 0, std::min(10L, v.size(-1)));
+    LOG(INFO) << "[LongCatImage] [DEBUG] Q (query, after RoPE) token 36 first "
+                 "10 dims: "
+              << q36;
+    LOG(INFO)
+        << "[LongCatImage] [DEBUG] K (key, after RoPE) token 36 first 10 dims: "
+        << k36;
+    LOG(INFO)
+        << "[LongCatImage] [DEBUG] V (value, no RoPE) token 36 first 10 dims: "
+        << v36;
+  }
+
   // 5. store k/v cache and do attention
   LOG(WARNING) << "[QWEN2_ATTENTION_DEBUG] About to call attn_->forward with "
                   "attn_mask.defined(): "
@@ -149,6 +180,19 @@ torch::Tensor Qwen2AttentionImpl::forward(
                << ", max_seq_len: " << attn_metadata.max_seq_len;
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
   LOG(WARNING) << "[QWEN2_ATTENTION_DEBUG] Returned from attn_->forward";
+
+  // Debug: Log attention output for layer 0, token 0 and 36
+  if (out.size(0) > 36) {
+    int64_t hd = out.size(-1);
+    auto attn_out_0 = out[0].slice(0, 0, std::min(10L, hd));
+    auto attn_out_36 = out[36].slice(0, 0, std::min(10L, hd));
+    LOG(INFO) << "[LongCatImage] [DEBUG] Attention output (before o_proj) - "
+                 "token 0 first 10 dims: "
+              << attn_out_0;
+    LOG(INFO) << "[LongCatImage] [DEBUG] Attention output (before o_proj) - "
+                 "token 36 first 10 dims: "
+              << attn_out_36;
+  }
 
   // 6. output projection
   return o_proj_->forward(out);

@@ -807,6 +807,13 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
               << ", max: " << hidden_states.max().item<float>()
               << ", mean: " << hidden_states.mean().item<float>()
               << ", std: " << hidden_states.std().item<float>();
+    if (tokens.size(0) > 36 && hidden_states.size(0) > 36) {
+      auto tid36 = tokens[36].item<int64_t>();
+      auto emb36 =
+          hidden_states[36].slice(0, 0, std::min(10L, hidden_states.size(-1)));
+      LOG(INFO) << "[forward_longcat] token 36 input_id: " << tid36
+                << ", embeddings[36] first 10 dims: " << emb36;
+    }
 
     // NOTE: Do NOT multiply hidden_states by attention mask here!
     // In diffusers, the attention_mask is used INSIDE the attention mechanism

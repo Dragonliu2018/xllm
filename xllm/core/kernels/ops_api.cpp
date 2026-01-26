@@ -78,18 +78,22 @@ void apply_rotary(RotaryParams& params) {
                   .contiguous();
 
     // MRoPE path: use precomputed per-token cos/sin (mrope_cos, mrope_sin).
-    // They have shape [num_tokens, rot_dim/2] each; we use them instead of
-    // indexing the 1D RoPE cache. Index with [0,1,...,T-1] to fetch each row.
-    // cos_sin is [T, 2*head_dim]; kernel must use head_size=head_dim, not
-    // 2*head_dim.
+    // apply_mrope produces [T, head_dim] each (head_dim=128). RoPE uses
+    // head_dim/2 pairs (0,64)..(63,127) within each head. The kernel expects
+    // cos_sin [T, rot_dim] with rot_dim = 64 cos + 64 sin = 128, so we slice
+    // to first head_dim/2 elements before cat. Otherwise rot_dim=256 would
+    // pair (0,128)..(127,255) and rotate across heads.
     const bool use_mrope_precomputed =
         params.cos.defined() && params.sin.defined() &&
         params.cos.size(0) == static_cast<int64_t>(T) &&
         params.sin.size(0) == static_cast<int64_t>(T);
     if (use_mrope_precomputed) {
-      cos_sin =
-          torch::cat({params.cos.contiguous(), params.sin.contiguous()}, -1);
-      override_head_size = params.cos.size(-1);
+      const int64_t head_dim = params.cos.size(-1);
+      const int64_t rot_half = head_dim / 2;
+      auto cos_sliced = params.cos.contiguous().slice(-1, 0, rot_half);
+      auto sin_sliced = params.sin.contiguous().slice(-1, 0, rot_half);
+      cos_sin = torch::cat({cos_sliced, sin_sliced}, -1);
+      override_head_size = head_dim;
       // Debug: verify cos/sin values passed to CUDA kernel
       if (params.cos.size(0) > 0 && params.cos.size(0) > 36) {
         auto cos0_sample =
@@ -101,7 +105,8 @@ void apply_rotary(RotaryParams& params) {
         auto sin36_sample =
             params.sin[36].slice(0, 0, std::min(10L, params.sin.size(-1)));
         LOG(INFO) << "[apply_rotary MRoPE] cos_sin shape: " << cos_sin.sizes()
-                  << ", override_head_size: " << override_head_size.value()
+                  << " (rot_dim=64+64), override_head_size: "
+                  << override_head_size.value()
                   << ", token 0 cos[0:10]: " << cos0_sample
                   << ", sin[0:10]: " << sin0_sample
                   << ", token 36 cos[0:10]: " << cos36_sample

@@ -51,6 +51,9 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
   // causal determines whether to use causal masking in the plan
   // When using custom mask, causal should be false
   if (is_prefill) {
+    VLOG(kGraphExecutorLogVerboseLevel)
+        << "update_plan_info: is_prefill=true, causal=" << causal
+        << " (false means using custom mask)";
     plan_info->uri = kernel::cuda::get_batch_prefill_uri(
         backend,
         query_dtype,
@@ -91,6 +94,9 @@ void update_plan_info(std::shared_ptr<PlanInfo> plan_info,
           causal);
     };
     if (backend == "fa2") {
+      VLOG(kGraphExecutorLogVerboseLevel)
+          << "update_plan_info: calling fa2_prefill_plan with causal="
+          << causal;
       plan_info->plan_info = call_plan_func(
           kernel::cuda::FunctionFactory::get_instance().fa2_prefill_plan_func(
               plan_info->uri));

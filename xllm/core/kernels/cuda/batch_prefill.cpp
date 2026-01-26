@@ -13,10 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdint>
 #include <limits>
+#include <string>
 
+#include "core/platform/device.h"
 #include "cuda_ops_api.h"
 #include "function_factory.h"
+#include "utils.h"
 
 namespace xllm::kernel::cuda {
 
@@ -51,7 +55,8 @@ void batch_prefill(const std::string& uri,
       if (m.device() != device) {
         m = m.to(device);
       }
-      // Ensure mask is float type for FlashInfer
+      // Ensure mask is float for constructing 2D combined mask (causal *
+      // padding)
       if (!m.is_floating_point()) {
         m = m.to(torch::kFloat32);
       }
@@ -96,82 +101,76 @@ void batch_prefill(const std::string& uri,
       // j <= i (causal) AND j is not padding (padding_mask[j] = 1)
       auto combined_mask = causal_mask * padding_mask_2d;
 
-      // Convert from (1=attend, 0=mask_out) to additive bias format
-      // (0=attend, large_negative=mask_out) for proper softmax zero-out
-      // Note: Using -65504.0f (max representable in float16) instead of -inf
-      // to avoid potential NaN issues when FlashInfer converts to bfloat16
-      // This matches HuggingFace's approach of using dtype.min for masking
-      const float mask_value = -65504.0f;  // Safe for both float16 and bfloat16
-      auto converted_mask =
-          torch::where(combined_mask > 0.5f,
-                       torch::zeros_like(combined_mask),
-                       torch::full_like(combined_mask, mask_value));
-
-      // Flatten the 2D mask to 1D for FlashInfer's packed format
-      // IMPORTANT: FlashInfer expects mask in row-major order:
-      // flat_mask[i * kv_len + j] = whether query i can attend to key j
-      // Since our converted_mask is already [query, key] format, we can flatten
-      // directly Use contiguous() to ensure proper memory layout for FlashInfer
-      auto flat_mask = converted_mask.contiguous().view({-1}).contiguous();
-
-      // Convert mask to match query dtype for consistency with FlashInfer
-      // FlashInfer may expect mask in same dtype as query/key/value
-      if (flat_mask.dtype() != query.dtype() && query.is_floating_point()) {
-        flat_mask = flat_mask.to(query.dtype());
-        LOG(INFO) << "[batch_prefill] Converted mask dtype to match query: "
-                  << query.dtype();
+      // FlashInfer custom mask is a PACKED BITMAP (see
+      // include/flashinfer/attention/variants.cuh):
+      // - 1 bit per (qo_idx, kv_idx), row-major offset = qo_idx * kv_len +
+      // kv_idx
+      // - Bit 1 = can attend, bit 0 = mask out. Packed 8 bits per byte
+      // (little-endian).
+      // - mask_indptr gives BYTE offsets into the packed buffer, not element
+      // counts.
+      const int64_t n = seq_len * seq_len;
+      const int64_t num_bytes = (n + 7) / 8;
+      auto flat = combined_mask.contiguous().view({-1});
+      if (flat.device().type() != torch::kCPU) {
+        flat = flat.cpu();
       }
-      processed_mask = flat_mask;
+      auto packed = torch::zeros(
+          {num_bytes},
+          torch::TensorOptions().dtype(torch::kUInt8).device(flat.device()));
+      auto flat_acc = flat.accessor<float, 1>();
+      auto packed_acc = packed.accessor<uint8_t, 1>();
+      for (int64_t i = 0; i < n; ++i) {
+        if (flat_acc[i] > 0.5f) {
+          packed_acc[i / 8] |= static_cast<uint8_t>(1u << (i % 8));
+        }
+      }
 
-      // Create mask_indptr for single sequence batching
-      // For a single sequence of length N, the 2D mask has N*N elements
-      // mask_indptr = [0, N*N] indicates the start and end of the mask
+      // Debug: Verify bitmap BEFORE moving to GPU (packed_acc is only valid on
+      // CPU)
+      auto mask_2d = combined_mask.view({seq_len, seq_len});
+      auto num_attend = (combined_mask > 0.5f).sum().item<int64_t>();
+      auto num_masked = (combined_mask <= 0.5f).sum().item<int64_t>();
+      auto row0_attend = (mask_2d[0] > 0.5f).sum().item<int64_t>();
+      auto input_mask_valid = (m > 0.5f).sum().item<int64_t>();
+
+      // Check combined_mask[0] first 8 positions to understand packed[0]
+      auto row0_cpu = mask_2d[0].cpu();
+      auto row0_acc = row0_cpu.accessor<float, 1>();
+      std::string row0_str = "row0[0:8]: [";
+      for (int i = 0; i < std::min(8L, seq_len); ++i) {
+        if (i > 0) row0_str += ", ";
+        row0_str += std::to_string(row0_acc[i]);
+      }
+      row0_str += "]";
+
+      uint8_t byte0 = packed_acc[0];  // Read before moving to GPU
+      int bit00 = (byte0 >> 0) & 1;
+      int bit01 = (byte0 >> 1) & 1;
+      LOG(INFO) << "[batch_prefill] Packed custom mask: " << seq_len << "x"
+                << seq_len << " -> " << num_bytes
+                << " bytes (bitmap), attend=" << num_attend
+                << " masked=" << num_masked;
+      LOG(INFO) << "[batch_prefill] mask_indptr (byte offsets): [0, "
+                << num_bytes << "], row0_attend=" << row0_attend
+                << " (expect 1), input_valid=" << input_mask_valid;
+      LOG(INFO) << "[batch_prefill] " << row0_str;
+      LOG(INFO) << "[batch_prefill] Verify bitmap: packed[0]=" << (int)byte0
+                << ", (0,0) bit=" << bit00 << " (expect 1), (0,1) bit=" << bit01
+                << " (expect 0)";
+
+      if (packed.device() != device) {
+        packed = packed.to(device);
+      }
+      processed_mask = packed.contiguous();
+
+      // mask_indptr: byte offsets for each batch. Single batch -> [0,
+      // num_bytes].
       auto mask_indptr = torch::zeros(
           {2}, torch::TensorOptions().dtype(torch::kInt32).device(device));
       mask_indptr[0] = 0;
-      mask_indptr[1] = static_cast<int32_t>(seq_len * seq_len);
+      mask_indptr[1] = static_cast<int32_t>(num_bytes);
       mask_indptr_opt = mask_indptr;
-
-      // Debug: Print processed mask statistics
-      LOG(INFO) << "[batch_prefill] Expanded mask from 1D [" << seq_len
-                << "] to 2D [" << seq_len << ", " << seq_len
-                << "], flattened to [" << flat_mask.size(0) << "]";
-      // Use float32 copy for min/max to avoid dtype issues
-      auto mask_float = flat_mask.to(torch::kFloat32);
-      LOG(INFO)
-          << "[batch_prefill] Processed mask (converted to additive bias) min: "
-          << mask_float.min().item<float>()
-          << ", max: " << mask_float.max().item<float>()
-          << ", dtype: " << flat_mask.dtype();
-      LOG(INFO) << "[batch_prefill] mask_indptr: [0, " << seq_len * seq_len
-                << "]";
-
-      // Debug: Count masked vs unmasked positions
-      auto num_attend = (mask_float > -1.0f).sum().item<int64_t>();
-      auto num_masked = (mask_float < -1.0f).sum().item<int64_t>();
-      LOG(INFO) << "[batch_prefill] Mask stats: attend=" << num_attend
-                << ", masked=" << num_masked
-                << ", total=" << (num_attend + num_masked);
-
-      // Debug: Check first row (query 0) and last row (query seq_len-1) of the
-      // 2D mask Row 0: should attend only to position 0 (causal + padding) Row
-      // seq_len-1: should attend to all non-padding positions from 0 to
-      // seq_len-1
-      auto mask_2d = mask_float.view({seq_len, seq_len});
-      auto row0_attend = (mask_2d[0] > -1.0f).sum().item<int64_t>();
-      auto row_last_attend =
-          (mask_2d[seq_len - 1] > -1.0f).sum().item<int64_t>();
-      auto input_mask_valid = (m > 0.5f).sum().item<int64_t>();
-      LOG(INFO) << "[batch_prefill] Mask row analysis: row0_attend="
-                << row0_attend
-                << " (expect 1 if pos 0 is valid), row_last_attend="
-                << row_last_attend << " (expect " << input_mask_valid
-                << " = input valid tokens)";
-      LOG(INFO) << "[batch_prefill] Sample mask values: "
-                << "mask_2d[0,0]=" << mask_2d[0][0].item<float>()
-                << ", mask_2d[0,1]=" << mask_2d[0][1].item<float>()
-                << ", mask_2d[1,0]=" << mask_2d[1][0].item<float>()
-                << ", mask_2d[1,1]=" << mask_2d[1][1].item<float>();
     }
   }
 
@@ -179,6 +178,28 @@ void batch_prefill(const std::string& uri,
   bool use_custom_mask = processed_mask.has_value();
   if (use_custom_mask) {
     LOG(INFO) << "[batch_prefill] Using CUSTOM mask mode (0) for attention";
+    LOG(INFO) << "[batch_prefill] uri=" << uri
+              << ", .so path=" << path_to_uri_so_lib(uri)
+              << ", Device::is_support_sm90a()=" << Device::is_support_sm90a();
+    if (Device::is_support_sm90a()) {
+      LOG(WARNING)
+          << "[batch_prefill] FlashInfer SM90 (Hopper) prefill returns "
+             "cudaErrorNotSupported for custom mask; if you see wrong "
+             "attention "
+             "output, use a non-SM90 GPU or build FlashInfer AOT without SM90.";
+    }
+    if (processed_mask.has_value()) {
+      auto mask_tensor = processed_mask.value();
+      LOG(INFO) << "[batch_prefill] Custom mask tensor: shape="
+                << mask_tensor.sizes() << ", dtype=" << mask_tensor.dtype()
+                << ", device=" << mask_tensor.device();
+      if (mask_indptr_opt.has_value()) {
+        auto indptr = mask_indptr_opt.value();
+        LOG(INFO) << "[batch_prefill] mask_indptr: shape=" << indptr.sizes()
+                  << ", values=[" << indptr[0].item<int32_t>() << ", "
+                  << indptr[1].item<int32_t>() << "]";
+      }
+    }
   }
 
   std::string backend =
