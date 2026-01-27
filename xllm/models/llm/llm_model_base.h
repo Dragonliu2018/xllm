@@ -131,7 +131,8 @@ class LlmModelImplBase : public torch::nn::Module {
             << l0_36;
       }
     }
-    // Final norm: Qwen2 norms hidden_states only (no residual add)
+    // Final norm: Qwen2 norms hidden_states only (no residual add).
+    // Match diffusers: keep bf16 (no float32).
     return std::get<0>(norm_->forward(h));
   }
 

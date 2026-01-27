@@ -121,8 +121,13 @@ torch::Tensor Qwen2AttentionImpl::forward(
                << attn_metadata.attn_mask.defined();
 
   // 1. qkv projection
-  auto qkv = qkv_proj_->forward(hidden_states);
-
+  // Ensure input dtype matches weight dtype before calling forward
+  torch::Tensor hidden_states_converted = hidden_states;
+  auto qkv_weight_dtype = qkv_proj_->weight().scalar_type();
+  if (hidden_states.scalar_type() != qkv_weight_dtype) {
+    hidden_states_converted = hidden_states.to(qkv_weight_dtype);
+  }
+  auto qkv = qkv_proj_->forward(hidden_states_converted);
   auto q = qkv.slice(/*dim=*/-1, 0, q_size_);
   auto k = qkv.slice(/*dim=*/-1, q_size_, q_size_ + kv_size_);
   auto v = qkv.slice(/*dim=*/-1, q_size_ + kv_size_, q_size_ + 2 * kv_size_);
@@ -131,10 +136,31 @@ torch::Tensor Qwen2AttentionImpl::forward(
 
   if (is_qwen3_style_) {
     // 2. q-norm
-    q = std::get<0>(q_norm_->forward(q));
+    // Ensure input dtype matches weight dtype before calling forward
+    auto q_weight_dtype = q_norm_->weight().scalar_type();
+    auto q_original_dtype = q.scalar_type();
+    torch::Tensor q_for_norm = q;
+    if (q.scalar_type() != q_weight_dtype) {
+      q_for_norm = q.to(q_weight_dtype);
+    }
+    q = std::get<0>(q_norm_->forward(q_for_norm));
+    // Convert back to original dtype if needed
+    if (q.scalar_type() != q_original_dtype) {
+      q = q.to(q_original_dtype);
+    }
 
     // 3. k-norm
-    k = std::get<0>(k_norm_->forward(k));
+    auto k_weight_dtype = k_norm_->weight().scalar_type();
+    auto k_original_dtype = k.scalar_type();
+    torch::Tensor k_for_norm = k;
+    if (k.scalar_type() != k_weight_dtype) {
+      k_for_norm = k.to(k_weight_dtype);
+    }
+    k = std::get<0>(k_norm_->forward(k_for_norm));
+    // Convert back to original dtype if needed
+    if (k.scalar_type() != k_original_dtype) {
+      k = k.to(k_original_dtype);
+    }
   }
 
   // 4. rope
@@ -194,7 +220,7 @@ torch::Tensor Qwen2AttentionImpl::forward(
               << attn_out_36;
   }
 
-  // 6. output projection
+  // 6. output projection. Match diffusers: keep bf16 (no float32).
   return o_proj_->forward(out);
 }
 

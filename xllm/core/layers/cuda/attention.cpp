@@ -200,12 +200,11 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>> AttentionImpl::forward(
       auto Kf_1HTD = Kf.permute({1, 0, 2}).unsqueeze(0);  // [1, H, T, D]
       auto scores = (Qf.unsqueeze(2) * Kf_1HTD).sum(-1) * scale_;
       scores = scores + add_mask.unsqueeze(1);
-      // Match diffusers: softmax in float32, cast attn to query dtype, matmul
-      // with V (same dtype).
+      // Match diffusers: softmax in float32, cast attn to query dtype; attn @ V
+      // in bf16.
       auto attn = torch::softmax(scores.to(torch::kFloat32), -1)
                       .to(query.scalar_type());
-      auto out = torch::einsum("thj,jhd->thd", {attn, Vr});
-      out = out.contiguous();
+      auto out = torch::einsum("thj,jhd->thd", {attn, Vr}).contiguous();
       auto result = out.view({-1, num_heads_ * head_size_});
       // Token-0 and token-36 diagnostic (causal: out[0,h,:] must equal
       // V[0,h,:]; head 0).
