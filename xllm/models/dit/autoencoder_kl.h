@@ -48,8 +48,11 @@ torch::Tensor randn_tensor(const std::vector<int64_t>& shape,
   at::Generator gen = at::detail::createCPUGenerator();
   gen = gen.clone();
   gen.set_current_seed(seed);
-  torch::Tensor latents;
-  latents = torch::randn(
+  // Match diffusers exactly: randn_tensor(shape, generator, device) does NOT
+  // pass dtype, so torch.randn uses float32. prepare_latents then
+  // latents.to(dtype=prompt_embeds.dtype). We therefore randn in float32 on
+  // CPU, then .to(options) for device + dtype.
+  torch::Tensor latents = torch::randn(
       shape, gen, options.device(torch::kCPU).dtype(torch::kFloat32));
   latents = latents.to(options);
   return latents;

@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <array>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -119,21 +121,41 @@ class LlmModelImplBase : public torch::nn::Module {
                 attn_metadata,
                 kv_caches[i],
                 modified_input_params);
-      if (i == 0 && h.size(0) > 36) {
+      if (h.size(0) > 36) {
         int64_t hd = h.size(-1);
-        auto l0_0 = h[0].slice(0, 0, std::min(10L, hd));
-        auto l0_36 = h[36].slice(0, 0, std::min(10L, hd));
-        LOG(INFO)
-            << "[LongCatImage] [DEBUG] After layer 0 - token 0 first 10 dims: "
-            << l0_0;
-        LOG(INFO)
-            << "[LongCatImage] [DEBUG] After layer 0 - token 36 first 10 dims: "
-            << l0_36;
+        // Log layers 0..26 before final norm. Layer 27 logged after norm (see
+        // below) to match diffusers: they store hidden_states[28] = after norm.
+        const std::array<size_t, 13> debug_layers_before_norm = {
+            0, 1, 2, 5, 10, 15, 20, 21, 22, 23, 24, 25, 26};
+        if (std::find(debug_layers_before_norm.begin(),
+                      debug_layers_before_norm.end(),
+                      i) != debug_layers_before_norm.end()) {
+          auto t0 = h[0].slice(0, 0, std::min(10L, hd));
+          auto t36 = h[36].slice(0, 0, std::min(10L, hd));
+          LOG(INFO) << "[LongCatImage] [DEBUG] After layer " << i
+                    << " - token 0 first 10 dims: " << t0;
+          LOG(INFO) << "[LongCatImage] [DEBUG] After layer " << i
+                    << " - token 36 first 10 dims: " << t36;
+        }
       }
     }
     // Final norm: Qwen2 norms hidden_states only (no residual add).
     // Match diffusers: keep bf16 (no float32).
-    return std::get<0>(norm_->forward(h));
+    torch::Tensor h_normed = std::get<0>(norm_->forward(h));
+    // Log "After layer 27" *after* final norm to match diffusers: their
+    // hidden_states[28] is after norm, not raw layer-27 output.
+    if (h_normed.size(0) > 36) {
+      int64_t hd = h_normed.size(-1);
+      auto t0 = h_normed[0].slice(0, 0, std::min(10L, hd));
+      auto t36 = h_normed[36].slice(0, 0, std::min(10L, hd));
+      LOG(INFO) << "[LongCatImage] [DEBUG] After layer 27 (after final norm) - "
+                   "token 0 first 10 dims: "
+                << t0;
+      LOG(INFO) << "[LongCatImage] [DEBUG] After layer 27 (after final norm) - "
+                   "token 36 first 10 dims: "
+                << t36;
+    }
+    return h_normed;
   }
 
   // load the weight from the checkpoint

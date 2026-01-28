@@ -247,7 +247,9 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
   DiTForwardOutput forward(const DiTForwardInput& input) {
     const auto& generation_params = input.generation_params;
 
-    auto seed = generation_params.seed > 0 ? generation_params.seed : 42;
+    // Default 43 to match diffusers run_longcat_image2
+    // (generator.manual_seed(43))
+    auto seed = generation_params.seed > 0 ? generation_params.seed : 43;
     auto prompts = std::make_optional(input.prompts);
     auto prompts_2 = input.prompts_2.empty()
                          ? std::nullopt
@@ -604,6 +606,8 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
           batch_size, adjusted_height / 2, adjusted_width / 2);
       return {latents.value(), latent_image_ids};
     }
+    LOG(INFO) << "[LongCatImage] prepare_latents randn seed: " << seed
+              << " (default 43 to match diffusers run_longcat_image2)";
     torch::Tensor latents_tensor = randn_tensor(shape, seed, options_);
     torch::Tensor packed_latents = pack_latents(latents_tensor,
                                                 batch_size,
@@ -1144,7 +1148,7 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                         num_channels_latents,
                         height,
                         width,
-                        seed.has_value() ? seed.value() : 42,
+                        seed.has_value() ? seed.value() : 43,
                         latents);
 
     LOG(INFO) << "[LongCatImage] prepared_latents shape: "
@@ -1207,6 +1211,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
         << prepared_latents.sizes()
         << ", encoded_prompt_embeds shape: " << encoded_prompt_embeds.sizes()
         << ", image_rotary_emb shape: " << image_rotary_emb.sizes();
+    // Diagnostic: sample prompt_embeds for diffusers comparison (first =
+    // Prefix, offset 36 = content at 36)
+    if (encoded_prompt_embeds.size(0) > 0 &&
+        encoded_prompt_embeds.size(1) > 36) {
+      int64_t hd = encoded_prompt_embeds.size(-1);
+      auto pe0 = encoded_prompt_embeds[0][0].slice(0, 0, std::min(10L, hd));
+      auto pe36 = encoded_prompt_embeds[0][36].slice(0, 0, std::min(10L, hd));
+      LOG(INFO) << "[LongCatImage] prompt_embeds[0,0,:10] (Prefix): " << pe0;
+      LOG(INFO) << "[LongCatImage] prompt_embeds[0,36,:10]: " << pe36;
+    }
 
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i].unsqueeze(0);
@@ -1216,12 +1230,18 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
 
       // Forward through transformer
       if (i == 0) {
+        float raw_t = t.item<float>();
         LOG(INFO)
             << "[LongCatImage] Step 0 - Transformer inputs - latents shape: "
             << prepared_latents.sizes()
             << ", prompt_embeds shape: " << encoded_prompt_embeds.sizes()
-            << ", timestep: " << timestep.item<float>()
+            << ", timestep (raw): " << raw_t
+            << ", timestep (scaled /1000): " << timestep.item<float>()
             << ", rotary_emb shape: " << image_rotary_emb.sizes();
+        auto pl0 = prepared_latents[0][0].slice(
+            0, 0, std::min(10L, prepared_latents.size(-1)));
+        LOG(INFO) << "[LongCatImage] Step 0 - latents[0,0,:10] (pre-forward): "
+                  << pl0;
       }
       torch::Tensor noise_pred = transformer_->forward(
           prepared_latents, encoded_prompt_embeds, timestep, image_rotary_emb);
