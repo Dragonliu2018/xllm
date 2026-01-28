@@ -83,6 +83,12 @@ message Parameters {
   // Minimum value for CFG renorm scale (LongCat-Image specific)
   optional float cfg_renorm_min = 10;
 
+  // Image height in pixels (align with diffusers; overrides size when both set)
+  optional int32 height = 11;
+
+  // Image width in pixels (align with diffusers; overrides size when both set)
+  optional int32 width = 12;
+
   // Output type, either "base64" or "url"
   // optional string output_type = 11;
 }

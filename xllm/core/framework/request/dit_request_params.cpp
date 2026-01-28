@@ -129,6 +129,13 @@ DiTRequestParams::DiTRequestParams(const proto::ImageGenerationRequest& request,
     generation_params.width = size.first;
     generation_params.height = size.second;
   }
+  // Align with diffusers: explicit height/width override size when present
+  if (params.has_height()) {
+    generation_params.height = params.height();
+  }
+  if (params.has_width()) {
+    generation_params.width = params.width();
+  }
   if (params.has_num_inference_steps()) {
     generation_params.num_inference_steps = params.num_inference_steps();
   }
