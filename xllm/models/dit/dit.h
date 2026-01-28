@@ -1828,7 +1828,9 @@ class LongCatImageTransformer2DModelImpl : public torch::nn::Module {
 
     for (int64_t i = 0; i < single_transformer_block_layers_.size(); ++i) {
       auto block = single_transformer_block_layers_[i];
-      auto [new_hidden, new_encoder_hidden] = block->forward(
+      // Block returns (encoder, hidden) per diffusers
+      // LongCatImageSingleTransformerBlock.
+      auto [new_encoder_hidden, new_hidden] = block->forward(
           hidden_states, encoder_hidden_states, temb, image_rotary_emb);
       hidden_states = new_hidden;
       encoder_hidden_states = new_encoder_hidden;

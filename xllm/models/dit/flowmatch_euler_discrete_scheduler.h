@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+#include <glog/logging.h>
 #include <torch/torch.h>
 
 #include <algorithm>
@@ -253,6 +254,12 @@ class FlowMatchEulerDiscreteSchedulerImpl : public torch::nn::Module {
       torch::Tensor sigma = sigmas_[sigma_idx];
       torch::Tensor sigma_next = sigmas_[sigma_idx + 1];
       torch::Tensor dt = sigma_next - sigma;
+      if (sigma_idx == 0) {
+        LOG(INFO) << "[LongCatImage] Scheduler Step 0 - sigma[0]: "
+                  << sigma.item<float>()
+                  << ", sigma[1]: " << sigma_next.item<float>()
+                  << ", dt: " << dt.item<float>();
+      }
       if (stochastic_sampling_) {
         torch::Tensor x0 = sample_float - sigma * model_output;
         torch::Tensor noise;

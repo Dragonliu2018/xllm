@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 #include <memory>
+#include <sstream>
 #include <string>
 
 #include "autoencoder_kl.h"
@@ -1159,12 +1160,15 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
               << ", mean: " << prepared_latents.mean().item<float>()
               << ", std: " << prepared_latents.std().item<float>();
 
-    // Prepare timesteps
+    // Prepare timesteps. Match diffusers: sigmas = np.linspace(1.0, 1.0/n,
+    // n).
     std::vector<float> new_sigmas;
+    double start = 1.0;
+    double end = 1.0 / static_cast<double>(num_inference_steps);
     for (int64_t i = 0; i < num_inference_steps; ++i) {
-      new_sigmas.push_back(1.0f - static_cast<float>(i) /
-                                      (num_inference_steps - 1) *
-                                      (1.0f - 1.0f / num_inference_steps));
+      double v = start + (end - start) * static_cast<double>(i) /
+                             (num_inference_steps - 1);
+      new_sigmas.push_back(static_cast<float>(v));
     }
 
     int64_t image_seq_len = prepared_latents.size(1);
@@ -1204,6 +1208,16 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                                   width / (vae_scale_factor_ * 2));
     std::vector<torch::Tensor> rot_embs = {rot_emb1, rot_emb2};
     torch::Tensor image_rotary_emb = torch::stack(rot_embs, 0);
+
+    torch::Tensor negative_image_rotary_emb;
+    if (do_classifier_free_guidance) {
+      auto [neg_rot1, neg_rot2] =
+          pos_embed_->forward_cache(negative_text_ids,
+                                    latent_image_ids,
+                                    height / (vae_scale_factor_ * 2),
+                                    width / (vae_scale_factor_ * 2));
+      negative_image_rotary_emb = torch::stack({neg_rot1, neg_rot2}, 0);
+    }
 
     // Denoising loop
     LOG(INFO)
@@ -1253,16 +1267,37 @@ class LongCatImagePipelineImpl : public torch::nn::Module {
                 << ", max: " << noise_pred.max().item<float>()
                 << ", mean: " << noise_pred.mean().item<float>()
                 << ", std: " << noise_pred.std().item<float>();
+      if (i == 0) {
+        auto fmt_slice = [&noise_pred](int64_t pos) {
+          auto s = noise_pred[0][pos].slice(
+              0, 0, std::min(20L, noise_pred.size(-1)));
+          std::ostringstream o;
+          o << "[";
+          for (int64_t k = 0; k < s.size(0); ++k) {
+            if (k) o << ", ";
+            o << s[k].item<float>();
+          }
+          o << "]";
+          return o.str();
+        };
+        LOG(INFO) << "[LongCatImage] Step 0 - noise_pred[0,0,:20]: "
+                  << fmt_slice(0);
+        LOG(INFO) << "[LongCatImage] Step 0 - noise_pred[0,1,:20]: "
+                  << fmt_slice(1);
+        int64_t mid = static_cast<int64_t>(noise_pred.size(1) / 2);
+        LOG(INFO) << "[LongCatImage] Step 0 - noise_pred[0," << mid
+                  << ",:20]: " << fmt_slice(mid);
+      }
 
       if (do_classifier_free_guidance) {
-        // Forward negative prompt
-        // Use a different step_idx (i + 10000) to avoid cache collision
-        // This ensures positive and negative prompts use separate cache entries
+        // Forward negative prompt. Use negative_image_rotary_emb (from
+        // negative_text_ids) to match diffusers; positive uses
+        // image_rotary_emb.
         torch::Tensor negative_noise_pred = transformer_->forward(
             prepared_latents,
             negative_encoded_embeds,
             timestep,
-            image_rotary_emb,
+            negative_image_rotary_emb,
             i + 10000);  // Use different step_idx to avoid cache collision
 
         // Save conditional prediction before CFG
