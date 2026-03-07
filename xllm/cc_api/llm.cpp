@@ -31,7 +31,7 @@ namespace {
 static std::atomic<bool> g_glog_inited = false;
 static pthread_mutex_t g_log_init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void InitGlog(const std::string& log_dir) {
+void InitGlog(const std::string& log_dir, XLLM_LogLevel log_level) {
   pthread_mutex_lock(&g_log_init_mutex);
   if (!g_glog_inited) {
     google::InitGoogleLogging("xllm");
@@ -41,7 +41,29 @@ void InitGlog(const std::string& log_dir) {
                               (log_dir + "/xllm.log.WARNING.").c_str());
     google::SetLogDestination(google::ERROR,
                               (log_dir + "/xllm.log.ERROR.").c_str());
-    google::SetStderrLogging(google::FATAL);
+
+    google::LogSeverity glog_level;
+    switch (log_level) {
+      case kLogLevelDebug:
+        glog_level = google::INFO;
+        break;
+      case kLogLevelInfo:
+        glog_level = google::INFO;
+        break;
+      case kLogLevelWarning:
+        glog_level = google::WARNING;
+        break;
+      case kLogLevelError:
+        glog_level = google::ERROR;
+        break;
+      case kLogLevelFatal:
+        glog_level = google::FATAL;
+        break;
+      default:
+        glog_level = google::WARNING;
+        break;
+    }
+    google::SetStderrLogging(glog_level);
 
     g_glog_inited = true;
   }
@@ -61,7 +83,7 @@ bool LLM::Initialize(const std::string& model_path,
                      const std::string& devices,
                      const XLLM_InitLLMOptions& init_options) {
   if (!init_options.log_dir.empty()) {
-    InitGlog(init_options.log_dir);
+    InitGlog(init_options.log_dir, init_options.log_level);
   }
 
   if (!std::filesystem::exists(model_path)) {

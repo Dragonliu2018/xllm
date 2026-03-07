@@ -113,8 +113,10 @@ enum class InferenceType {
  * @note This API is idempotent (multiple calls have same effect as single call)
  * @note Thread-safe: protected by pthread mutex to prevent race condition
  * @param log_dir Directory to store log files (empty = current directory)
+ * @param log_level Minimum log level to output (default = kLogLevelWarning)
  */
-void init_log(const std::string& log_dir);
+void init_log(const std::string& log_dir,
+              XLLM_LogLevel log_level = kLogLevelWarning);
 
 /**
  * @brief Safely shutdown glog and release resources

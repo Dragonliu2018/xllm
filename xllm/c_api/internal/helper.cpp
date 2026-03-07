@@ -33,7 +33,7 @@ std::string generate_request_id() {
          short_uuid.random();
 }
 
-void init_log(const std::string& log_dir) {
+void init_log(const std::string& log_dir, XLLM_LogLevel log_level) {
   if (g_glog_inited.load(std::memory_order_acquire)) {
     return;
   }
@@ -49,7 +49,30 @@ void init_log(const std::string& log_dir) {
                               (log_prefix + "xllm.log.WARNING.").c_str());
     google::SetLogDestination(google::ERROR,
                               (log_prefix + "xllm.log.ERROR.").c_str());
-    google::SetStderrLogging(google::FATAL);
+
+    google::LogSeverity glog_level;
+    switch (log_level) {
+      case kLogLevelDebug:
+        glog_level = google::INFO;
+        break;
+      case kLogLevelInfo:
+        glog_level = google::INFO;
+        break;
+      case kLogLevelWarning:
+        glog_level = google::WARNING;
+        break;
+      case kLogLevelError:
+        glog_level = google::ERROR;
+        break;
+      case kLogLevelFatal:
+        glog_level = google::FATAL;
+        break;
+      default:
+        glog_level = google::WARNING;
+        break;
+    }
+    google::SetStderrLogging(glog_level);
+
     g_glog_inited.store(true, std::memory_order_release);
   }
   pthread_mutex_unlock(&g_log_init_mutex);
@@ -131,6 +154,7 @@ void set_init_options(BackendType backend_type,
   XLLM_SET_FIELD_IF_NONEMPTY(xllm_init_options, init_options, log_dir);
   XLLM_SET_FIELD_IF_NONEMPTY(xllm_init_options, init_options, draft_model);
   XLLM_SET_FIELD_IF_NONEMPTY(xllm_init_options, init_options, draft_devices);
+  xllm_init_options->log_level = init_options->log_level;
 
   return;
 }

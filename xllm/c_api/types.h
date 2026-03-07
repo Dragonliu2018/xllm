@@ -35,6 +35,26 @@ extern "C" {
 // Core Struct & Enum Definitions
 
 /**
+ * @brief Log verbosity levels for xLLM runtime output
+ */
+typedef enum XLLM_CAPI_EXPORT XLLM_LogLevel {
+  /** Debug-level messages (most verbose) */
+  kLogLevelDebug = 0,
+
+  /** Informational messages */
+  kLogLevelInfo = 1,
+
+  /** Warning messages */
+  kLogLevelWarning = 2,
+
+  /** Error messages only */
+  kLogLevelError = 3,
+
+  /** Fatal errors only (least verbose) */
+  kLogLevelFatal = 4,
+} XLLM_LogLevel;
+
+/**
  * @brief Configuration options for initializing an LLM instance
  * @note All string fields are fixed-length arrays. Default values are defined
  * in macros. Empty string indicates disable/use default value.
@@ -129,6 +149,9 @@ typedef struct XLLM_CAPI_EXPORT XLLM_InitOptions {
 
   /** Log directory path (empty string = disable logging) */
   char log_dir[XLLM_META_STRING_FIELD_MAX_LEN];
+
+  /** Minimum log level to output (default = kLogLevelWarning) */
+  XLLM_LogLevel log_level;
 
   /** Draft hf model path (empty string = no draft model) */
   char draft_model[XLLM_META_STRING_FIELD_MAX_LEN];

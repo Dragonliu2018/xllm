@@ -68,7 +68,8 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
 
     std::string log_dir(xllm_init_options.log_dir);
     if (!log_dir.empty()) {
-      xllm::helper::init_log(xllm_init_options.log_dir);
+      xllm::helper::init_log(xllm_init_options.log_dir,
+                             xllm_init_options.log_level);
     }
 
     if (!std::filesystem::exists(model_path)) {

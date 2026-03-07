@@ -55,6 +55,7 @@ const XLLM_InitOptions XLLM_INIT_LLM_OPTIONS_DEFAULT = {
     .instance_name = "",
     .kv_cache_transfer_mode = "PUSH",
     .log_dir = "",
+    .log_level = kLogLevelWarning,
     .draft_model = "",
     .draft_devices = ""};
 
@@ -113,6 +114,7 @@ const XLLM_InitOptions XLLM_INIT_REC_OPTIONS_DEFAULT = {
     .instance_name = "",
     .kv_cache_transfer_mode = "PUSH",
     .log_dir = "",
+    .log_level = kLogLevelWarning,
     .draft_model = "",
     .draft_devices = ""};
 

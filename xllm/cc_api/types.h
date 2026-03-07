@@ -25,6 +25,17 @@ limitations under the License.
 
 namespace xllm {
 
+/**
+ * @brief Log verbosity levels for xLLM runtime output
+ */
+enum XLLM_CAPI_EXPORT XLLM_LogLevel {
+  kLogLevelDebug = 0,    // Debug-level messages (most verbose)
+  kLogLevelInfo = 1,     // Informational messages
+  kLogLevelWarning = 2,  // Warning messages
+  kLogLevelError = 3,    // Error messages only
+  kLogLevelFatal = 4,    // Fatal errors only (least verbose)
+};
+
 struct XLLM_CAPI_EXPORT XLLM_ChatMessage {
   // The role of the messages author. One of "system", "user", "assistant".
   std::string role;
@@ -135,6 +146,9 @@ struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   std::string kv_cache_transfer_mode = "PUSH";
 
   std::string log_dir;
+
+  // Minimum log level to output (default = kLogLevelWarning)
+  XLLM_LogLevel log_level = kLogLevelWarning;
 
   // draft hf model path to the model file
   std::optional<std::string> draft_model = std::nullopt;
