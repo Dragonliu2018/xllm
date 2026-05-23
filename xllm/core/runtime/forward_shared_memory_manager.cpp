@@ -335,14 +335,18 @@ inline size_t get_dit_generation_params_size(
                4  // true_cfg_scale, guidance_scale, strength, cfg_renorm_min
          + type_size<uint32_t>  // num_images_per_prompt
          + type_size<int64_t>   // seed
+         + type_size<bool>      // seed_is_set
          + type_size<bool>      // enable_cfg_renorm
          + type_size<int32_t>   // num_frames
          + type_size<bool>      // force_video_output
          + type_size<double>    // video_fps
          + type_size<float> *   // guidance_scale_2, boundary_ratio, flow_shift
                3 +
-         type_size<int32_t>      // seconds
-         + type_size<uint32_t>;  // num_videos_per_prompt
+         type_size<int32_t>        // seconds
+         + type_size<uint32_t>     // num_videos_per_prompt
+         + type_size<int32_t> * 2  // max_new_tokens, diffusion_steps
+         + type_size<float> * 3    // temperature, top_p, repetition_penalty
+         + type_size<int32_t>;     // top_k
 }
 
 inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
@@ -374,7 +378,8 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
 }
 
 inline size_t get_dit_forward_output_size(const DiTForwardOutput& output) {
-  return get_vector_tensor_size(output.tensors);
+  return get_vector_tensor_size(output.tensors) +
+         get_string_vector_size(output.text_output);
 }
 
 template <typename T>
@@ -987,6 +992,7 @@ inline void write_dit_generation_params(char*& buffer,
   write_data(buffer, params.guidance_scale);
   write_data(buffer, params.num_images_per_prompt);
   write_data(buffer, params.seed);
+  write_data(buffer, params.seed_is_set);
   write_data(buffer, params.max_sequence_length);
   write_data(buffer, params.strength);
   write_data(buffer, params.enable_cfg_renorm);
@@ -999,6 +1005,12 @@ inline void write_dit_generation_params(char*& buffer,
   write_data(buffer, params.boundary_ratio);
   write_data(buffer, params.flow_shift);
   write_data(buffer, params.num_videos_per_prompt);
+  write_data(buffer, params.max_new_tokens);
+  write_data(buffer, params.diffusion_steps);
+  write_data(buffer, params.temperature);
+  write_data(buffer, params.top_k);
+  write_data(buffer, params.top_p);
+  write_data(buffer, params.repetition_penalty);
 }
 
 inline void write_dit_generation_params(RawInputSerializeContext& context,
@@ -1010,6 +1022,7 @@ inline void write_dit_generation_params(RawInputSerializeContext& context,
   write_data(context.descriptor, params.guidance_scale);
   write_data(context.descriptor, params.num_images_per_prompt);
   write_data(context.descriptor, params.seed);
+  write_data(context.descriptor, params.seed_is_set);
   write_data(context.descriptor, params.max_sequence_length);
   write_data(context.descriptor, params.strength);
   write_data(context.descriptor, params.enable_cfg_renorm);
@@ -1022,6 +1035,12 @@ inline void write_dit_generation_params(RawInputSerializeContext& context,
   write_data(context.descriptor, params.boundary_ratio);
   write_data(context.descriptor, params.flow_shift);
   write_data(context.descriptor, params.num_videos_per_prompt);
+  write_data(context.descriptor, params.max_new_tokens);
+  write_data(context.descriptor, params.diffusion_steps);
+  write_data(context.descriptor, params.temperature);
+  write_data(context.descriptor, params.top_k);
+  write_data(context.descriptor, params.top_p);
+  write_data(context.descriptor, params.repetition_penalty);
 }
 
 inline void write_dit_forward_input(char*& buffer,
@@ -1074,6 +1093,7 @@ inline void write_dit_forward_input(RawInputSerializeContext& context,
 inline void write_dit_forward_output(char*& buffer,
                                      const DiTForwardOutput& output) {
   write_vector_tensor(buffer, output.tensors);
+  write_string_vector(buffer, output.text_output);
 }
 
 inline void safe_advance_buffer(const char*& buffer, size_t offset) {
@@ -1897,6 +1917,7 @@ inline void read_dit_generation_params(const char*& buffer,
   read_data(buffer, params.guidance_scale);
   read_data(buffer, params.num_images_per_prompt);
   read_data(buffer, params.seed);
+  read_data(buffer, params.seed_is_set);
   read_data(buffer, params.max_sequence_length);
   read_data(buffer, params.strength);
   read_data(buffer, params.enable_cfg_renorm);
@@ -1909,6 +1930,12 @@ inline void read_dit_generation_params(const char*& buffer,
   read_data(buffer, params.boundary_ratio);
   read_data(buffer, params.flow_shift);
   read_data(buffer, params.num_videos_per_prompt);
+  read_data(buffer, params.max_new_tokens);
+  read_data(buffer, params.diffusion_steps);
+  read_data(buffer, params.temperature);
+  read_data(buffer, params.top_k);
+  read_data(buffer, params.top_p);
+  read_data(buffer, params.repetition_penalty);
 }
 
 inline void read_dit_generation_params(ReadContext& context,
@@ -1920,6 +1947,7 @@ inline void read_dit_generation_params(ReadContext& context,
   read_data(context, params.guidance_scale);
   read_data(context, params.num_images_per_prompt);
   read_data(context, params.seed);
+  read_data(context, params.seed_is_set);
   read_data(context, params.max_sequence_length);
   read_data(context, params.strength);
   read_data(context, params.enable_cfg_renorm);
@@ -1932,6 +1960,12 @@ inline void read_dit_generation_params(ReadContext& context,
   read_data(context, params.boundary_ratio);
   read_data(context, params.flow_shift);
   read_data(context, params.num_videos_per_prompt);
+  read_data(context, params.max_new_tokens);
+  read_data(context, params.diffusion_steps);
+  read_data(context, params.temperature);
+  read_data(context, params.top_k);
+  read_data(context, params.top_p);
+  read_data(context, params.repetition_penalty);
 }
 
 inline void read_dit_forward_input(const char*& buffer,
@@ -2014,6 +2048,7 @@ inline void read_dit_forward_input(ReadContext& context,
 inline void read_dit_forward_output(const char*& buffer,
                                     DiTForwardOutput& output) {
   read_vector_tensor(buffer, output.tensors);
+  read_string_vector(buffer, output.text_output);
 }
 
 inline void initialize_device_buffer_session(ReadContext& context,
@@ -2647,6 +2682,7 @@ void convert_tensor_to_raw_output(
     const torch::Tensor& embeddings,
     const std::vector<torch::Tensor>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
+    const std::vector<std::string>& dit_text_output,
     const torch::Tensor& expert_load_data,
     int32_t prepared_layer_id,
     const torch::Tensor& src_seq_idxes,
@@ -2692,6 +2728,7 @@ void convert_tensor_to_raw_output(
   raw_output.outputs.reserve(num_seqs);
   raw_output.mm_embeddings = mm_embeddings;
   raw_output.dit_forward_output.tensors = dit_images;
+  raw_output.dit_forward_output.text_output = dit_text_output;
   for (int32_t output_idx = 0; output_idx < num_seqs; ++output_idx) {
     RawSampleOutput raw_sample_output;
 
@@ -2974,6 +3011,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const torch::Tensor& embeddings,
     const std::vector<torch::Tensor>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
+    const std::vector<std::string>& dit_text_output,
     const torch::Tensor& expert_load_data,
     int32_t prepared_layer_id,
     const torch::Tensor& src_seq_idxes,
@@ -2987,6 +3025,7 @@ bool ForwardSharedMemoryManager::raw_output_write(
                                embeddings,
                                mm_embeddings,
                                dit_images,
+                               dit_text_output,
                                expert_load_data,
                                prepared_layer_id,
                                src_seq_idxes,

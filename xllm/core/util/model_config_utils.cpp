@@ -24,6 +24,62 @@ limitations under the License.
 
 namespace xllm::util {
 
+namespace {
+
+bool try_read_model_type_from_config(const std::filesystem::path& config_path,
+                                     std::string* model_type) {
+  if (!std::filesystem::exists(config_path)) {
+    return false;
+  }
+  JsonReader reader;
+  if (!reader.parse(config_path.string())) {
+    return false;
+  }
+  if (auto value = reader.value<std::string>("model_type")) {
+    *model_type = value.value();
+    return true;
+  }
+  if (auto value = reader.value<std::string>("model_name")) {
+    *model_type = value.value();
+    return true;
+  }
+  return false;
+}
+
+bool discover_model_type_from_subdirs(const std::filesystem::path& model_path,
+                                      std::string* model_type) {
+  for (const auto& entry : std::filesystem::directory_iterator(model_path)) {
+    if (!entry.is_directory()) {
+      continue;
+    }
+    const std::string dir_name = entry.path().filename().string();
+    if (dir_name.empty() || dir_name[0] == '.') {
+      continue;
+    }
+    if (try_read_model_type_from_config(entry.path() / "config.json",
+                                        model_type)) {
+      return true;
+    }
+    for (const auto& nested_entry :
+         std::filesystem::directory_iterator(entry.path())) {
+      if (!nested_entry.is_directory()) {
+        continue;
+      }
+      const std::string nested_name = nested_entry.path().filename().string();
+      if (nested_name.empty() || nested_name[0] == '.') {
+        continue;
+      }
+      if (try_read_model_type_from_config(nested_entry.path() / "config.json",
+                                          model_type)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
 std::string get_model_type(const JsonReader& reader,
                            const std::filesystem::path& model_path,
                            std::optional<std::string> backend) {
@@ -62,10 +118,22 @@ std::string get_model_type(const JsonReader& reader,
 std::string get_model_type(const std::filesystem::path& model_path,
                            std::optional<std::string> backend) {
   JsonReader reader;
-  // for llm, vlm and rec models, the config.json file is in the model path
-  const std::filesystem::path config_json_path = model_path / "config.json";
+  const std::filesystem::path model_index_path =
+      model_path / "model_index.json";
+  if (std::filesystem::exists(model_index_path)) {
+    if (reader.parse(model_index_path.string())) {
+      if (auto value = reader.value<std::string>("_class_name")) {
+        return value.value();
+      }
+    }
+  }
 
+  const std::filesystem::path config_json_path = model_path / "config.json";
   if (!std::filesystem::exists(config_json_path)) {
+    std::string discovered_model_type;
+    if (discover_model_type_from_subdirs(model_path, &discovered_model_type)) {
+      return discovered_model_type;
+    }
     LOG(FATAL) << "Please check config.json or model_index.json file, one of "
                   "them should exist in the model path: "
                << model_path;

@@ -177,6 +177,7 @@ void WorkerService::step(ForwardInput& fwd_input,
                          torch::Tensor& embeddings,
                          std::vector<torch::Tensor>& mm_embeddings,
                          std::vector<torch::Tensor>& dit_images,
+                         std::vector<std::string>& dit_text_output,
                          torch::Tensor& expert_load_data,
                          int32_t& prepared_layer_id,
                          torch::Tensor& src_seq_idxes,
@@ -226,6 +227,7 @@ void WorkerService::step(ForwardInput& fwd_input,
             dit_images.emplace_back(
                 safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
           }
+          dit_text_output = dit_forward_output.text_output;
 
           // [num_seq]
           next_tokens = safe_to(sample_output.next_tokens,
@@ -318,6 +320,7 @@ void WorkerService::create_polling_shm_thread(
           torch::Tensor embeddings;
           std::vector<torch::Tensor> mm_embeddings;
           std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
           torch::Tensor expert_load_data;
           int32_t prepared_layer_id = -1;
 
@@ -334,6 +337,7 @@ void WorkerService::create_polling_shm_thread(
                embeddings,
                mm_embeddings,
                dit_images,
+               dit_text_output,
                expert_load_data,
                prepared_layer_id,
                src_seq_idxes,
@@ -347,6 +351,7 @@ void WorkerService::create_polling_shm_thread(
                                                embeddings,
                                                mm_embeddings,
                                                dit_images,
+                                               dit_text_output,
                                                expert_load_data,
                                                prepared_layer_id,
                                                src_seq_idxes,
@@ -742,6 +747,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         torch::Tensor embeddings;
         std::vector<torch::Tensor> mm_embeddings;
         std::vector<torch::Tensor> dit_images;
+        std::vector<std::string> dit_text_output;
         torch::Tensor expert_load_data;
         int32_t prepared_layer_id = -1;
         // beam search kernel output
@@ -757,6 +763,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              embeddings,
              mm_embeddings,
              dit_images,
+             dit_text_output,
              expert_load_data,
              prepared_layer_id,
              src_seq_idxes,
@@ -774,6 +781,7 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                 out_tokens,
                                 out_logprobs,
                                 dit_images,
+                                dit_text_output,
                                 pb_forward_output);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
       });
@@ -807,6 +815,7 @@ void WorkerService::GetLastStepResult(
           torch::Tensor out_tokens;
           torch::Tensor out_logprobs;
           std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
           auto copy_output_to_host = [&]() {
             if (options_.enable_schedule_overlap()) {
               CHECK(stream_->wait_event(forward_output.ready_event))
@@ -829,6 +838,8 @@ void WorkerService::GetLastStepResult(
             for (auto image : forward_output.dit_forward_output.tensors) {
               dit_images.emplace_back(image);
             }
+            dit_text_output =
+                forward_outputs.value().dit_forward_output.text_output;
 
             // [num_seq]
             next_tokens = safe_to(sample_output.next_tokens,
@@ -885,7 +896,8 @@ void WorkerService::GetLastStepResult(
           }
           record_speculative_metrics_from_output(next_tokens, options_);
 
-          if (next_tokens.defined() ||
+          if (next_tokens.defined() || !dit_images.empty() ||
+              !dit_text_output.empty() ||
               ::xllm::EPLBConfig::get_instance().enable_eplb()) {
             forward_output_to_proto(next_tokens,
                                     logprobs,
@@ -898,6 +910,7 @@ void WorkerService::GetLastStepResult(
                                     out_tokens,
                                     out_logprobs,
                                     dit_images,
+                                    dit_text_output,
                                     pb_forward_output);
           }
         }

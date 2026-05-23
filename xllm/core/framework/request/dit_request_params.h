@@ -13,8 +13,16 @@
 #include "image_generation.pb.h"
 #include "request.h"
 #include "tensor.pb.h"
+#include "text_generation.pb.h"
 #include "video_generation.pb.h"
 namespace xllm {
+
+enum class DiTRequestKind : int8_t {
+  kImage = 0,
+  kAudio = 1,
+  kVideo = 2,
+  kText = 3,
+};
 
 struct DiTRequestParams {
   DiTRequestParams() = default;
@@ -27,6 +35,9 @@ struct DiTRequestParams {
   DiTRequestParams(const proto::VideoGenerationRequest& request,
                    const std::string& x_rid,
                    const std::string& x_rtime);
+  DiTRequestParams(const proto::TextGenerationRequest& request,
+                   const std::string& x_rid,
+                   const std::string& x_rtime);
 
   bool verify_params(DiTOutputCallback callback) const;
 
@@ -36,6 +47,8 @@ struct DiTRequestParams {
   std::string x_request_time;
 
   std::string model;
+
+  DiTRequestKind request_kind = DiTRequestKind::kImage;
 
   DiTInputParams input_params;
   // Mandatory: Generation control parameters (encapsulates all fields related

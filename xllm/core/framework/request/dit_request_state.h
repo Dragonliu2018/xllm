@@ -39,7 +39,7 @@ struct DiTGenerationParams {
            true_cfg_scale == other.true_cfg_scale &&
            guidance_scale == other.guidance_scale &&
            num_images_per_prompt == other.num_images_per_prompt &&
-           seed == other.seed &&
+           seed == other.seed && seed_is_set == other.seed_is_set &&
            max_sequence_length == other.max_sequence_length &&
            strength == other.strength &&
            enable_cfg_renorm == other.enable_cfg_renorm &&
@@ -54,7 +54,12 @@ struct DiTGenerationParams {
            video_fps == other.video_fps &&
            guidance_scale_2 == other.guidance_scale_2 &&
            seconds == other.seconds && boundary_ratio == other.boundary_ratio &&
-           flow_shift == other.flow_shift;
+           flow_shift == other.flow_shift &&
+           max_new_tokens == other.max_new_tokens &&
+           diffusion_steps == other.diffusion_steps &&
+           temperature == other.temperature && top_k == other.top_k &&
+           top_p == other.top_p &&
+           repetition_penalty == other.repetition_penalty;
   }
 
   bool operator!=(const DiTGenerationParams& other) const {
@@ -75,7 +80,13 @@ struct DiTGenerationParams {
 
   uint32_t num_videos_per_prompt = 1;
 
+  // Default seed for image/audio DiT models when the client omits seed (legacy
+  // behavior). Cola-DLM uses seed_is_set to distinguish explicit seed=0 from
+  // unset (stochastic) requests.
   int64_t seed = 0;
+
+  // True when the client explicitly set seed in the request (proto has_seed).
+  bool seed_is_set = false;
 
   int32_t max_sequence_length = 512;
 
@@ -111,6 +122,14 @@ struct DiTGenerationParams {
   float boundary_ratio = 0.9f;
 
   float flow_shift = 1.0f;
+
+  // Text diffusion generation params (for Cola-DLM)
+  int32_t max_new_tokens = 256;
+  int32_t diffusion_steps = 16;
+  float temperature = 0.0f;
+  int32_t top_k = 0;
+  float top_p = 1.0f;
+  float repetition_penalty = 1.1f;
 };
 
 struct DiTInputParams {

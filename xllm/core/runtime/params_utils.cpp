@@ -88,6 +88,7 @@ void forward_output_to_proto(const torch::Tensor& next_tokens,
                              const torch::Tensor& out_tokens,
                              const torch::Tensor& out_logprobs,
                              const std::vector<torch::Tensor>& dit_images,
+                             const std::vector<std::string>& dit_text_output,
                              proto::ForwardOutput* pb_forward_output) {
   Timer timer;
   int32_t num_seqs = next_tokens.size(0);
@@ -242,6 +243,12 @@ void forward_output_to_proto(const torch::Tensor& next_tokens,
     TORCH_TENSOR_VEC_TO_PROTO_TENSOR_LIST(
         pb_forward_output->mutable_dit_forward_output()->mutable_tensors(),
         dit_images);
+  }
+  if (!dit_text_output.empty()) {
+    auto* pb_dit_output = pb_forward_output->mutable_dit_forward_output();
+    for (const auto& text : dit_text_output) {
+      pb_dit_output->add_text_output(text);
+    }
   }
   COUNTER_ADD(proto_latency_seconds_o2proto, timer.elapsed_seconds());
   return;
@@ -402,7 +409,9 @@ bool generation_params_to_proto(
       dit_generation_params.guidance_scale);
   pb_dit_generation_params->set_num_images_per_prompt(
       dit_generation_params.num_images_per_prompt);
-  pb_dit_generation_params->set_seed(dit_generation_params.seed);
+  if (dit_generation_params.seed_is_set) {
+    pb_dit_generation_params->set_seed(dit_generation_params.seed);
+  }
   pb_dit_generation_params->set_max_sequence_length(
       dit_generation_params.max_sequence_length);
   pb_dit_generation_params->set_strength(dit_generation_params.strength);
@@ -422,6 +431,20 @@ bool generation_params_to_proto(
   pb_dit_generation_params->set_flow_shift(dit_generation_params.flow_shift);
   pb_dit_generation_params->set_num_videos_per_prompt(
       dit_generation_params.num_videos_per_prompt);
+  // Text diffusion params
+  if (dit_generation_params.max_new_tokens > 0) {
+    pb_dit_generation_params->set_max_new_tokens(
+        dit_generation_params.max_new_tokens);
+  }
+  if (dit_generation_params.diffusion_steps > 0) {
+    pb_dit_generation_params->set_diffusion_steps(
+        dit_generation_params.diffusion_steps);
+  }
+  pb_dit_generation_params->set_temperature(dit_generation_params.temperature);
+  pb_dit_generation_params->set_top_k(dit_generation_params.top_k);
+  pb_dit_generation_params->set_top_p(dit_generation_params.top_p);
+  pb_dit_generation_params->set_repetition_penalty(
+      dit_generation_params.repetition_penalty);
   return true;
 }
 
@@ -531,7 +554,10 @@ bool proto_to_generation_params(
       pb_dit_generation_params.guidance_scale();
   dit_generation_params.num_images_per_prompt =
       pb_dit_generation_params.num_images_per_prompt();
-  dit_generation_params.seed = pb_dit_generation_params.seed();
+  if (pb_dit_generation_params.has_seed()) {
+    dit_generation_params.seed = pb_dit_generation_params.seed();
+    dit_generation_params.seed_is_set = true;
+  }
   dit_generation_params.max_sequence_length =
       pb_dit_generation_params.max_sequence_length();
   dit_generation_params.strength = pb_dit_generation_params.strength();
@@ -551,6 +577,28 @@ bool proto_to_generation_params(
   dit_generation_params.flow_shift = pb_dit_generation_params.flow_shift();
   dit_generation_params.num_videos_per_prompt =
       pb_dit_generation_params.num_videos_per_prompt();
+  // Text diffusion params
+  if (pb_dit_generation_params.has_max_new_tokens()) {
+    dit_generation_params.max_new_tokens =
+        pb_dit_generation_params.max_new_tokens();
+  }
+  if (pb_dit_generation_params.has_diffusion_steps()) {
+    dit_generation_params.diffusion_steps =
+        pb_dit_generation_params.diffusion_steps();
+  }
+  if (pb_dit_generation_params.has_temperature()) {
+    dit_generation_params.temperature = pb_dit_generation_params.temperature();
+  }
+  if (pb_dit_generation_params.has_top_k()) {
+    dit_generation_params.top_k = pb_dit_generation_params.top_k();
+  }
+  if (pb_dit_generation_params.has_top_p()) {
+    dit_generation_params.top_p = pb_dit_generation_params.top_p();
+  }
+  if (pb_dit_generation_params.has_repetition_penalty()) {
+    dit_generation_params.repetition_penalty =
+        pb_dit_generation_params.repetition_penalty();
+  }
   return true;
 }
 
@@ -568,6 +616,11 @@ bool proto_to_dit_forward_output(const proto::DiTForwardOutput& pb_dit_outputs,
     torch_tensor_vec.emplace_back(std::move(torch_tensor));
   }
   dit_outputs.tensors = std::move(torch_tensor_vec);
+
+  // Deserialize text_output for text diffusion models
+  dit_outputs.text_output.assign(pb_dit_outputs.text_output().begin(),
+                                 pb_dit_outputs.text_output().end());
+
   return true;
 }
 
