@@ -40,6 +40,20 @@ std::string get_model_type(const JsonReader& reader,
                << ", it should contain model_type or model_name key.";
   }
 
+  // Architecture-based mapping for models that reuse a base model_type
+  // but have their own xLLM implementation.
+  if (*model_type == "qwen2") {
+    auto architectures =
+        reader.value<std::vector<std::string>>("architectures");
+    if (architectures.has_value()) {
+      for (const auto& arch : *architectures) {
+        if (arch == "MiMoV2ASRForCausalLM") {
+          return "mimo_audio";
+        }
+      }
+    }
+  }
+
   const bool is_qwen35_native_model_type =
       *model_type == "qwen3_5" || *model_type == "qwen3_5_moe";
   const bool use_vlm_model_type = backend.has_value() && *backend == "vlm";

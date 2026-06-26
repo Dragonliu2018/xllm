@@ -805,6 +805,22 @@ bool HFModelLoader::load_model_args(const std::string& model_weights_path) {
       util::should_enable_mla(std::filesystem::path(model_weights_path),
                               ModelConfig::get_instance().backend()));
 
+  // Fallback: if speech_empty_token_id is not set in config.json, try to
+  // read it from added_tokens.json (used by MiMo-V2.5-ASR).
+  if (args_.speech_empty_token_id() < 0) {
+    const std::string added_tokens_path =
+        model_weights_path + "/added_tokens.json";
+    JsonReader added_tokens_reader;
+    if (added_tokens_reader.parse(added_tokens_path)) {
+      auto empty_id = added_tokens_reader.value<int32_t>("<|empty|>");
+      if (empty_id.has_value()) {
+        args_.speech_empty_token_id() = empty_id.value();
+        LOG(INFO) << "Loaded speech_empty_token_id=" << empty_id.value()
+                  << " from added_tokens.json";
+      }
+    }
+  }
+
   return true;
 }
 

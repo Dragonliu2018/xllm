@@ -535,6 +535,40 @@ struct ModelArgs {
   PROPERTY(bool, zero_cond_t) = false;
   PROPERTY(bool, use_additional_t_cond) = false;
   PROPERTY(bool, use_layer3d_rope) = false;
+
+  // MiMo-V2.5-ASR audio model args
+  // Number of parallel audio channels (RVQ codebooks used for ASR input)
+  PROPERTY(int32_t, audio_channels) = 8;
+  // Number of audio frames grouped per text token
+  PROPERTY(int32_t, group_size) = 4;
+  // Per-channel speech vocabulary sizes, e.g. [1025, 1025, 129, ...]
+  PROPERTY(std::vector<int64_t>, speech_vocab_sizes);
+  // Per-channel padding/empty token indices, e.g. [1024, 1024, 128, ...]
+  PROPERTY(std::vector<int32_t>, speech_empty_ids);
+  // Per-channel delay pattern for local autoregressive generation
+  PROPERTY(std::vector<int32_t>, delay_pattern);
+  // Hidden dimension of the local (speech-token) transformer
+  PROPERTY(int64_t, local_dim) = 0;
+  // Number of layers in the local transformer
+  PROPERTY(int32_t, local_layers) = 0;
+  // Number of attention heads in the local transformer
+  PROPERTY(int32_t, local_attn_heads) = 0;
+  // FFN intermediate size in the local transformer
+  PROPERTY(int64_t, local_ffn_dim) = 0;
+  // Attention dropout in the local transformer
+  PROPERTY(float, local_attn_dropout) = 0.0f;
+  // Number of layers in the input-local (speech-group encoder) transformer
+  PROPERTY(int32_t, input_local_layers) = 0;
+  // Hidden dimension of the input-local transformer
+  PROPERTY(int64_t, input_local_dim) = 0;
+  // Whether input-local transformer uses full (bidirectional) attention
+  PROPERTY(bool, input_full_attention) = false;
+  // Token ID for <|sosp|> (start-of-speech)
+  PROPERTY(int32_t, sosp_token_id) = -1;
+  // Token ID for <|eosp|> (end-of-speech)
+  PROPERTY(int32_t, eosp_token_id) = -1;
+  // Token ID for <|empty|> used in the text channel at audio positions
+  PROPERTY(int32_t, speech_empty_token_id) = -1;
 };
 
 // Qwen hybrid models may describe full-attention layers explicitly via
