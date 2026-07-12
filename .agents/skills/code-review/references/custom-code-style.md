@@ -157,6 +157,43 @@ ModelOutput forward(torch::Tensor tokens, ...) override;
 virtual ModelOutput forward(torch::Tensor tokens, ...);
 ```
 
+- **Make const member functions thread safe unless you are certain they will never be used concurrently.** `const` means logical constness, not thread safety. If a `const` member function reads or updates shared state (including `mutable` lazy caches), protect that state with a mutex, or use `std::atomic` only when a single variable or memory location is involved. Do not use multiple independent atomics to guard related fields that must be updated together.
+
+```cpp
+// Good – const query with mutable lazy cache protected by mutex
+RootsType roots() const {
+  std::lock_guard<std::mutex> lock(m_);
+  if (!roots_are_valid_) {
+    // compute and store root_vals_
+    roots_are_valid_ = true;
+  }
+  return root_vals_;
+}
+
+bool query_state() const {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+  if (!state_invalidated_) {
+    return ready_;
+  }
+  return recompute_state_locked();
+}
+```
+
+```cpp
+// Bad – const method mutates mutable cache without synchronization
+RootsType roots() const {
+  if (!roots_are_valid_) {
+    root_vals_ = compute_roots();
+    roots_are_valid_ = true;
+  }
+  return root_vals_;
+}
+
+// Bad – two atomics do not protect related cache fields as a unit
+mutable std::atomic<bool> cache_valid{false};
+mutable std::atomic<int> cached_value;
+```
+
 - **Structs must not have member functions**. If you need methods, use a `class`. Structs are for plain data aggregation only.
 
 ---

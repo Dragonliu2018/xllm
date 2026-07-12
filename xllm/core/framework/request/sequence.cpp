@@ -170,8 +170,9 @@ void Sequence::generate_onerec_output(const Slice<int32_t>& ids,
   if (output_embedding_.defined()) {
     output.embedding = output_embedding_;
   }
-  if (finish_reason_ != FinishReason::NONE) {
-    output.finish_reason = finish_reason_.to_string();
+  FinishReason reason = finish_reason();
+  if (reason != FinishReason::NONE) {
+    output.finish_reason = reason.to_string();
   }
   output.token_ids = ids.slice(num_prompt_tokens_, size);
   if (::xllm::RecConfig::get_instance().enable_output_sku_logprobs() &&
@@ -296,9 +297,6 @@ Sequence::Sequence(const Sequence& other)
       onerec_state_(other.onerec_state_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
       request_id_(other.request_id_),
-      finished_(other.finished_),
-      finish_status_invalidated_(other.finish_status_invalidated_),
-      finish_reason_(other.finish_reason_),
       closed_(other.closed_),
       dp_rank_(other.dp_rank_),
       cur_generated_token_idx_(other.cur_generated_token_idx_),
@@ -306,6 +304,12 @@ Sequence::Sequence(const Sequence& other)
       is_pre_scheduled_step_prefill_(other.is_pre_scheduled_step_prefill_),
       updated_since_last_beam_search_(other.updated_since_last_beam_search_),
       termination_flag_(std::make_shared<std::atomic<int32_t>>(INT32_MAX)) {
+  {
+    std::lock_guard<std::mutex> lock(other.finish_mutex_);
+    finished_ = other.finished_;
+    finish_status_invalidated_ = other.finish_status_invalidated_;
+    finish_reason_ = other.finish_reason_;
+  }
   logprob_state_ = std::make_unique<LogprobState>(*other.logprob_state_);
   // A forked sequence (beam / best_of) shares the prompt KV prefix by
   // ref-counting those blocks, but its linear-state / embedding resource block
@@ -335,7 +339,15 @@ void Sequence::record_first_token(const Token& token) {
 void Sequence::append_token(const Token& token) {
   CHECK_LT(num_tokens_, tokens_.size())
       << "exceed the token capacity of the sequence";
-  CHECK(!finished_) << "cannot append token to a finished sequence";
+  {
+    std::lock_guard<std::mutex> lock(finish_mutex_);
+    if (!finish_status_invalidated_) {
+      CHECK(!finished_) << "cannot append token to a finished sequence";
+    } else {
+      CHECK(!recompute_finish_state_locked())
+          << "cannot append token to a finished sequence";
+    }
+  }
   if (!is_onerec_model()) {
     CHECK(kv_state_.kv_cache_tokens_num() > 0 && !is_chunked_prefill_stage())
         << "cannot append token to a prefill sequence";
@@ -358,7 +370,7 @@ void Sequence::append_token(const Token& token) {
 
   // skip update in enable_schedule_overlap
   if (sequence_params_.enable_schedule_overlap && token_id < 0) {
-    finish_status_invalidated_ = true;
+    invalidate_finish_status();
     return;
   }
 
@@ -372,7 +384,7 @@ void Sequence::append_token(const Token& token) {
   }
 
   // invalidate the finish status once a new token is appended
-  finish_status_invalidated_ = true;
+  invalidate_finish_status();
   updated_since_last_beam_search_ = true;
 }
 
@@ -417,7 +429,7 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
         sequence_params_.sampling_param->top_logprobs);
   }
   ++cur_generated_token_idx_;
-  finish_status_invalidated_ = true;
+  invalidate_finish_status();
   updated_since_last_beam_search_ = true;
 }
 
@@ -441,36 +453,54 @@ void Sequence::update_token(size_t index, const Token& token) {
         index, token, sequence_params_.sampling_param->top_logprobs);
   }
   // logprobs_[index] = token.logprob;
-  finish_status_invalidated_ = true;
+  invalidate_finish_status();
 }
 
 void Sequence::update_mm_embeddings(
     const std::vector<torch::Tensor>& mm_embeddings) {
-  // cannot update embeddings to a finished sequence
-  if (finished_) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(finish_mutex_);
+    if (!finish_status_invalidated_) {
+      if (finished_) {
+        return;
+      }
+    } else if (recompute_finish_state_locked()) {
+      return;
+    }
   }
+  // cannot update embeddings to a finished sequence
   output_mm_embeddings_ = mm_embeddings;
   CHECK(sequence_params_.sampling_param->is_embeddings);
-  // invalidate the finish status once a new token is appended
-  finish_status_invalidated_ = false;
-  finished_ = true;
-  finish_reason_ = FinishReason::STOP;
+  {
+    std::lock_guard<std::mutex> lock(finish_mutex_);
+    finish_status_invalidated_ = false;
+    finished_ = true;
+    finish_reason_ = FinishReason::STOP;
+  }
 }
 
 void Sequence::update_embeddings(const torch::Tensor& embeddings) {
-  // cannot update embeddings to a finished sequence
-  if (finished_) {
-    return;
+  {
+    std::lock_guard<std::mutex> lock(finish_mutex_);
+    if (!finish_status_invalidated_) {
+      if (finished_) {
+        return;
+      }
+    } else if (recompute_finish_state_locked()) {
+      return;
+    }
   }
+  // cannot update embeddings to a finished sequence
   if (embeddings.defined()) {
     output_embedding_ = embeddings;
   }
   if (sequence_params_.sampling_param->is_embeddings) {
-    // invalidate the finish status once a new token is appended
-    finish_status_invalidated_ = false;
-    finished_ = true;
-    finish_reason_ = FinishReason::STOP;
+    {
+      std::lock_guard<std::mutex> lock(finish_mutex_);
+      finish_status_invalidated_ = false;
+      finished_ = true;
+      finish_reason_ = FinishReason::STOP;
+    }
   } else {
     if (output_embedding_.dim() == 1) {
       output_embedding_ = output_embedding_.unsqueeze(0);
@@ -556,8 +586,9 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
 SequenceOutput Sequence::generate_output() {
   SequenceOutput output;
   output.index = index_;
-  if (finish_reason_ != FinishReason::NONE) {
-    output.finish_reason = finish_reason_.to_string();
+  FinishReason reason = finish_reason();
+  if (reason != FinishReason::NONE) {
+    output.finish_reason = reason.to_string();
   }
 
   return output;
@@ -676,8 +707,9 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
   if (output_embedding_.defined()) {
     output.embedding = output_embedding_;
   }
-  if (finish_reason_ != FinishReason::NONE) {
-    output.finish_reason = finish_reason_.to_string();
+  FinishReason reason = finish_reason();
+  if (reason != FinishReason::NONE) {
+    output.finish_reason = reason.to_string();
   }
 
   // record the start index of token ids
@@ -780,12 +812,17 @@ void Sequence::invalidate_block_hashes_from(size_t token_index) {
   }
 }
 
-bool Sequence::finished() const {
-  // return the cached finish status
-  if (!finish_status_invalidated_) {
-    return finished_;
-  }
+FinishReason Sequence::finish_reason() const {
+  std::lock_guard<std::mutex> lock(finish_mutex_);
+  return finish_reason_;
+}
 
+void Sequence::invalidate_finish_status() {
+  std::lock_guard<std::mutex> lock(finish_mutex_);
+  finish_status_invalidated_ = true;
+}
+
+bool Sequence::recompute_finish_state_locked() const {
   if (is_onerec_model() && num_tokens_ == num_prompt_tokens_) {
     return false;
   }
@@ -796,17 +833,24 @@ bool Sequence::finished() const {
     return false;
   }
 
-  // reset the finish status invalidation flag
   finish_status_invalidated_ = false;
 
-  auto finish_reason =
+  const auto reason =
       sequence_params_.stopping_checker->check(tokens(), num_prompt_tokens_);
-  if (finish_reason != FinishReason::NONE) {
-    finish_reason_ = finish_reason;
+  if (reason != FinishReason::NONE) {
+    finish_reason_ = reason;
     finished_ = true;
     return true;
   }
   return false;
+}
+
+bool Sequence::finished() const {
+  std::lock_guard<std::mutex> lock(finish_mutex_);
+  if (!finish_status_invalidated_) {
+    return finished_;
+  }
+  return recompute_finish_state_locked();
 }
 
 int64_t Sequence::tbt(const absl::Time& now) {
@@ -883,6 +927,7 @@ bool Sequence::update_prefetch_result(uint32_t timeout, uint32_t& success_cnt) {
 }
 
 void Sequence::finish() {
+  std::lock_guard<std::mutex> lock(finish_mutex_);
   finished_ = true;
   finish_status_invalidated_ = false;
   if (finish_reason_ == FinishReason::NONE) {
@@ -891,10 +936,11 @@ void Sequence::finish() {
 }
 
 void Sequence::reset_finish_state_for_beam_search() {
+  std::lock_guard<std::mutex> lock(finish_mutex_);
   finished_ = false;
   finish_reason_ = FinishReason::NONE;
   finish_status_invalidated_ = true;
-  finished();
+  recompute_finish_state_locked();
 }
 
 }  // namespace xllm

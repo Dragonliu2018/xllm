@@ -21,6 +21,7 @@ limitations under the License.
 #include <folly/futures/Future.h>
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -231,7 +232,7 @@ class Sequence final {
     return if_cache;
   }
 
-  FinishReason finish_reason() const { return finish_reason_; }
+  FinishReason finish_reason() const;
   // check finish status, use cached value if not invalidated
   bool finished() const;
   // mark sequence as finished (used by rec model multi-round decoding)
@@ -422,6 +423,9 @@ class Sequence final {
   }
 
  private:
+  bool recompute_finish_state_locked() const;
+  void invalidate_finish_status();
+
   void record_first_token(const Token& token);
 
   // Drop cached block hashes that may be stale after the token at
@@ -530,6 +534,8 @@ class Sequence final {
 
   // the reason why the sequence is finished
   mutable FinishReason finish_reason_ = FinishReason::NONE;
+
+  mutable std::mutex finish_mutex_;
 
   // is the sequence closed.
   bool closed_ = false;
